@@ -71,9 +71,9 @@ CertLock 是一款轻量级 Windows 安全工具，通过调用系统原生的 *
 
 ### 方式 1：下载 .exe（推荐）
 
-从 [Releases](https://github.com/zhaofeiy2002-ctrl/certlock/releases) 下载 `CertLock.zip`（含 `CertLock.exe`），解压后 **右键 → 以管理员身份运行**。
+[**⬇️ 下载 CertLock_v1.2.1.zip**](https://github.com/zhaofeiy2002-ctrl/certlock/raw/master/CertLock_v1.2.1.zip)（10.8 MB）
 
-> 仓库根目录也提供 `dist/CertLock_v1.2.1.zip` 直接下载。
+解压后 **右键 `CertLock.exe` → 以管理员身份运行**，即刻使用。
 
 > ⚠️ **必须以管理员身份运行** — 写入 SRP 策略需要修改 `HKLM` 注册表项。
 
