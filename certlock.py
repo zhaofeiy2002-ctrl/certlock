@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
-CertLock v1.4.2 — Windows Certificate Blocker
+CertLock v1.5.0 — Windows Certificate/Hash Blocker
 =============================================
 A lightweight GUI tool to block unwanted software via Windows
 Software Restriction Policy (SRP) certificate rules.
 
-Features: cert blocking/unblocking, 6 built-in presets, dark mode,
-          restart warning banner, impact preview, policy backup/restore.
+Features: cert/hash blocking, 6 presets, dark mode, CLI mode,
+          restart banner, impact preview, policy backup/restore,
+          operation history, community template import/export.
 
 Style: Single-window, portable, no-install, ZyperWin++ aesthetic.
 Requires: Python 3.6+ (tkinter built-in), Windows 10/11
@@ -18,22 +19,26 @@ Repo: https://github.com/zhaofeiy2002-ctrl/certlock
 
 import os
 import sys
+import json
 import ctypes
 import hashlib
 import base64
 import struct
+import argparse
 import winreg
 import subprocess
 import tkinter as tk
+from collections import deque
 from tkinter import ttk, messagebox, filedialog
 
 # ============================================================
 # Constants
 # ============================================================
 APP_NAME    = "CertLock"
-APP_VERSION = "1.4.2"
+APP_VERSION = "1.5.0"
 SRP_ROOT    = r"SOFTWARE\Policies\Microsoft\Windows\Safer\CodeIdentifiers"
 CERT_RULES  = SRP_ROOT + "\\0\\Certificates"
+HASH_RULES  = SRP_ROOT + "\\0\\Hashes"
 
 # Built-in certificate presets
 # Format: { "label": { "thumbprint", "vendor", "products", "cert_data"(optional) } }
@@ -350,6 +355,235 @@ def reg_import_rules(data):
             errors += 1
 
     return success, skipped, errors
+
+
+# ============================================================
+# Hash Rule Operations (for unsigned software)
+# ============================================================
+def _compute_sha256(filepath):
+    """Compute SHA256 hash of a file. Returns hex string."""
+    sha256 = hashlib.sha256()
+    with open(filepath, 'rb') as f:
+        for chunk in iter(lambda: f.read(65536), b''):
+            sha256.update(chunk)
+    return sha256.hexdigest().upper()
+
+
+def reg_list_hashes():
+    """List all hash rules. Returns list of dicts."""
+    results = []
+    try:
+        srp = reg_open_srp("r")
+        if srp is None:
+            return results
+        try:
+            hashes_key = winreg.OpenKey(
+                winreg.HKEY_LOCAL_MACHINE, HASH_RULES, 0, winreg.KEY_READ
+            )
+        except FileNotFoundError:
+            winreg.CloseKey(srp)
+            return results
+
+        idx = 0
+        while True:
+            try:
+                hash_val = winreg.EnumKey(hashes_key, idx)
+                rule = winreg.OpenKey(
+                    winreg.HKEY_LOCAL_MACHINE,
+                    f"{HASH_RULES}\\{hash_val}", 0, winreg.KEY_READ
+                )
+                try:
+                    desc, _ = winreg.QueryValueEx(rule, "Description")
+                except FileNotFoundError:
+                    desc = "(no description)"
+                try:
+                    flags, _ = winreg.QueryValueEx(rule, "SaferFlags")
+                except FileNotFoundError:
+                    flags = 0
+                try:
+                    data, _ = winreg.QueryValueEx(rule, "ItemData")
+                except FileNotFoundError:
+                    data = ""
+
+                results.append({
+                    "hash": hash_val,
+                    "description": desc,
+                    "disallowed": (flags == 0),
+                    "hash_data": data,
+                })
+                winreg.CloseKey(rule)
+                idx += 1
+            except OSError:
+                break
+
+        winreg.CloseKey(hashes_key)
+        winreg.CloseKey(srp)
+    except Exception as e:
+        import sys
+        print(f"[CertLock] reg_list_hashes failed: {e}", file=sys.stderr)
+    return results
+
+
+def reg_add_hash(filepath_or_hash, description):
+    """Add a hash rule to block a file by its SHA256.
+    Accepts either a file path (computes SHA256) or a raw hex hash string.
+    Returns True on success."""
+    if len(filepath_or_hash) == 64 and all(c in '0123456789ABCDEFabcdef' for c in filepath_or_hash):
+        sha256 = filepath_or_hash.upper()
+    else:
+        try:
+            sha256 = _compute_sha256(filepath_or_hash)
+        except Exception:
+            return False
+
+    try:
+        # Ensure Hashes container exists
+        try:
+            winreg.OpenKey(
+                winreg.HKEY_LOCAL_MACHINE, HASH_RULES, 0, winreg.KEY_ALL_ACCESS
+            )
+        except FileNotFoundError:
+            winreg.CreateKey(winreg.HKEY_LOCAL_MACHINE, HASH_RULES)
+
+        # Create rule key
+        rule = winreg.CreateKey(
+            winreg.HKEY_LOCAL_MACHINE, f"{HASH_RULES}\\{sha256}"
+        )
+        winreg.SetValueEx(rule, "ItemData", 0, winreg.REG_BINARY, b'\x00' * 20)
+        winreg.SetValueEx(rule, "SaferFlags", 0, winreg.REG_DWORD, 0)
+        winreg.SetValueEx(rule, "Description", 0, winreg.REG_SZ, description)
+        winreg.CloseKey(rule)
+
+        # Refresh policy
+        subprocess.run(["gpupdate", "/target:computer", "/force"],
+                       capture_output=True, timeout=30)
+        return True
+    except Exception:
+        return False
+
+
+def reg_remove_hash(sha256):
+    """Remove a hash rule. Returns True on success."""
+    try:
+        rule_path = f"{HASH_RULES}\\{sha256}"
+        # Delete values first, then key
+        try:
+            rule = winreg.OpenKey(
+                winreg.HKEY_LOCAL_MACHINE, rule_path, 0,
+                winreg.KEY_ALL_ACCESS | winreg.KEY_WOW64_64KEY
+            )
+            for name in ("ItemData", "SaferFlags", "Description"):
+                try:
+                    winreg.DeleteValue(rule, name)
+                except FileNotFoundError:
+                    pass
+            winreg.CloseKey(rule)
+        except FileNotFoundError:
+            pass
+
+        # Open parent and delete subkey
+        parent = winreg.OpenKey(
+            winreg.HKEY_LOCAL_MACHINE, HASH_RULES, 0,
+            winreg.KEY_ALL_ACCESS | winreg.KEY_WOW64_64KEY
+        )
+        winreg.DeleteKey(parent, sha256)
+        winreg.CloseKey(parent)
+
+        subprocess.run(["gpupdate", "/target:computer", "/force"],
+                       capture_output=True, timeout=30)
+        return True
+    except Exception:
+        return False
+
+
+# ============================================================
+# Community Template (JSON-based shared blocklist)
+# ============================================================
+def export_community_template(filepath, selected_entries):
+    """Export selected cert/hash rules as a community template JSON.
+    selected_entries: list of {type:'cert'|'hash', thumbprint/hash, description, cert_data/hash_data}"""
+    template = {
+        'format_version': '1.0',
+        'source': 'CertLock',
+        'exported_by': os.environ.get('USERNAME', 'anonymous'),
+        'exported_at': '',  # filled by caller
+        'vendor_info': {
+            'name': '',
+            'website': '',
+            'products': '',
+            'notes': '',
+        },
+        'rules': [],
+    }
+    for entry in selected_entries:
+        rule = {
+            'type': entry.get('type', 'cert'),
+            'description': entry.get('description', ''),
+            'disallowed': True,
+        }
+        if rule['type'] == 'cert':
+            rule['thumbprint'] = entry.get('thumbprint', '')
+            rule['cert_data'] = entry.get('cert_data', '')
+        else:
+            rule['sha256'] = entry.get('hash', '')
+        template['rules'].append(rule)
+
+    with open(filepath, 'w', encoding='utf-8') as f:
+        json.dump(template, f, indent=2, ensure_ascii=False)
+    return len(template['rules'])
+
+
+def import_community_template(filepath):
+    """Import rules from a community template JSON.
+    Returns (added_cert, added_hash, skipped, errors)."""
+    with open(filepath, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+
+    if not isinstance(data, dict) or 'rules' not in data:
+        return 0, 0, 0, 1
+
+    existing_certs = {c['thumbprint'].upper() for c in reg_list_certs()}
+    existing_hashes = {h['hash'].upper() for h in reg_list_hashes()}
+
+    added_cert = 0
+    added_hash = 0
+    skipped = 0
+    errors = 0
+
+    for rule in data.get('rules', []):
+        rtype = rule.get('type', 'cert')
+        desc = rule.get('description', 'Blocked via community template')
+        if rtype == 'cert':
+            tp = rule.get('thumbprint', '')
+            blob = rule.get('cert_data', '')
+            if not tp or not blob:
+                errors += 1
+                continue
+            if tp.upper() in existing_certs:
+                skipped += 1
+                continue
+            if reg_add_cert(tp, blob, desc):
+                added_cert += 1
+                existing_certs.add(tp.upper())
+            else:
+                errors += 1
+        elif rtype == 'hash':
+            h = rule.get('sha256', '')
+            if not h or len(h) != 64:
+                errors += 1
+                continue
+            if h.upper() in existing_hashes:
+                skipped += 1
+                continue
+            if reg_add_hash(h, desc):
+                added_hash += 1
+                existing_hashes.add(h.upper())
+            else:
+                errors += 1
+        else:
+            errors += 1
+
+    return added_cert, added_hash, skipped, errors
 
 
 # ============================================================
@@ -722,6 +956,12 @@ class CertLockApp:
         # Detect system theme
         self.is_dark = detect_dark_mode()
 
+        # Operation history (max 20 entries)
+        self.history = deque(maxlen=20)
+
+        # View toggle: cert or hash rules
+        self.show_hashes = False
+
         # Set icon (optional)
         try:
             self.root.iconbitmap(default="")
@@ -838,14 +1078,21 @@ class CertLockApp:
         # List section
         list_header = ttk.Frame(main_frame)
         list_header.pack(fill=tk.X)
-        ttk.Label(
+        self.list_title = ttk.Label(
             list_header, text="已封禁证书列表",
             font=("Segoe UI", 10, "bold")
-        ).pack(side=tk.LEFT)
+        )
+        self.list_title.pack(side=tk.LEFT)
         ttk.Label(
             list_header, text="(SaferFlags=0 表示已阻止运行)",
             style="Status.TLabel", foreground="gray"
         ).pack(side=tk.LEFT, padx=(8, 0))
+        # View toggle
+        self.btn_toggle_view = ttk.Button(
+            list_header, text="查看哈希规则", width=14,
+            command=self.on_toggle_view
+        )
+        self.btn_toggle_view.pack(side=tk.RIGHT)
 
         # Treeview
         tree_frame = ttk.Frame(main_frame)
@@ -881,6 +1128,12 @@ class CertLockApp:
         )
         self.btn_block.pack(side=tk.LEFT, padx=(0, 6))
 
+        self.btn_block_hash = ttk.Button(
+            btn_frame, text="🔒 封禁文件(哈希)",
+            command=self.on_block_hash, width=16
+        )
+        # Hidden until hash view is active
+
         self.btn_remove = ttk.Button(
             btn_frame, text="✖ 移除选中",
             command=self.on_remove, width=14
@@ -894,8 +1147,20 @@ class CertLockApp:
         self.btn_refresh.pack(side=tk.LEFT)
 
         # Right-side buttons
+        self.btn_template_import = ttk.Button(
+            btn_frame, text="📥 导入模板",
+            command=self.on_import_template, width=14
+        )
+        self.btn_template_import.pack(side=tk.RIGHT, padx=(6, 0))
+
+        self.btn_template_export = ttk.Button(
+            btn_frame, text="📋 导出模板",
+            command=self.on_export_template, width=14
+        )
+        self.btn_template_export.pack(side=tk.RIGHT, padx=(0, 0))
+
         self.btn_export = ttk.Button(
-            btn_frame, text="📋 导出证书",
+            btn_frame, text="💾 导出证书",
             command=self.on_export, width=14
         )
         self.btn_export.pack(side=tk.RIGHT, padx=(6, 0))
@@ -1019,6 +1284,44 @@ class CertLockApp:
             text="已封禁的软件在重启前仍可运行",
             bg=rb_bg, fg=rb_fg, font=("Segoe UI", 9)
         ).pack(side=tk.LEFT, padx=(8, 0))
+
+        # --- Operation history panel (collapsible) ---
+        if self.is_dark:
+            h_bg, h_fg, h_border = '#252526', '#d4d4d4', '#3e3e42'
+        else:
+            h_bg, h_fg, h_border = '#f8f9fa', '#333333', '#dee2e6'
+        self.history_frame = tk.Frame(
+            self.root, bg=h_bg,
+            highlightbackground=h_border, highlightthickness=1
+        )
+        # History header (click to toggle)
+        self.history_header = tk.Frame(self.history_frame, bg=h_bg, cursor='hand2')
+        self.history_header.pack(fill=tk.X, padx=10, pady=(6, 0))
+        self.history_toggle_btn = tk.Label(
+            self.history_header, text="▶ 最近操作",
+            bg=h_bg, fg=h_fg, font=("Segoe UI", 9, "bold"), cursor='hand2'
+        )
+        self.history_toggle_btn.pack(side=tk.LEFT)
+        self.history_count_lbl = tk.Label(
+            self.history_header, text="",
+            bg=h_bg, fg='#808080', font=("Segoe UI", 8), cursor='hand2'
+        )
+        self.history_count_lbl.pack(side=tk.LEFT, padx=(8, 0))
+        self.btn_undo_last = tk.Button(
+            self.history_header, text="↩ 撤销上一步",
+            bg='#3e3e42' if self.is_dark else '#e9ecef',
+            fg=h_fg, font=("Segoe UI", 8),
+            relief=tk.FLAT, cursor='hand2',
+            command=self._undo_last
+        )
+        # Bind header click to toggle
+        for w in (self.history_header, self.history_toggle_btn, self.history_count_lbl):
+            w.bind('<Button-1>', lambda e: self._toggle_history())
+
+        # History content (list of labels)
+        self.history_content = tk.Frame(self.history_frame, bg=h_bg)
+        self.history_labels = []
+        self._history_visible = False
 
         # --- Status bar ---
         status_frame = ttk.Frame(self.root, padding=(16, 6, 16, 8))
@@ -1166,67 +1469,8 @@ class CertLockApp:
             widgets['state'] = state
 
     # ============================================================
-    # Actions
+    # Preset State Management
     # ============================================================
-    def refresh_list(self):
-        """Refresh the certificate list from registry."""
-        for item in self.tree.get_children():
-            self.tree.delete(item)
-
-        certs = reg_list_certs()
-        if not certs:
-            self.tree.insert("", tk.END, values=(
-                "(空)", "尚未封禁任何证书", ""
-            ))
-            self.status_label.config(
-                text="未检测到已封禁证书 | 点击「封禁新证书」或下方预设"
-            )
-        else:
-            for c in certs:
-                status_text = "已阻止" if c['disallowed'] else "已允许"
-                self.tree.insert("", tk.END, values=(
-                    c['thumbprint'],
-                    c['description'],
-                    status_text
-                ))
-            self.status_label.config(
-                text=f"共 {len(certs)} 个证书规则 | 重启后完全生效"
-            )
-
-        # Update policy status
-        if reg_is_policy_active():
-            self.policy_label.config(
-                text="策略: 已启用",
-                foreground="#4ec94e" if self.is_dark else "green"
-            )
-        else:
-            self.policy_label.config(
-                text="策略: 未配置",
-                foreground="#f44747" if self.is_dark else "red"
-            )
-
-        # Show/hide restart warning banner
-        if certs:
-            self.restart_banner.pack(
-                fill=tk.X, side=tk.BOTTOM,
-                before=self._status_separator
-            )
-        else:
-            self.restart_banner.pack_forget()
-
-        # Show/hide cert data missing banner (source run without certs/ folder)
-        is_frozen = getattr(sys, 'frozen', False)
-        if not is_frozen and not PRESET_CERT_DATA:
-            self.certdata_banner.pack(
-                fill=tk.X, side=tk.BOTTOM,
-                before=self._status_separator
-            )
-        else:
-            self.certdata_banner.pack_forget()
-
-        # Update preset button states
-        self._update_preset_states()
-
     def _update_preset_states(self):
         """Check which presets are already blocked and update status + card colors."""
         existing = reg_list_certs()
@@ -1358,45 +1602,13 @@ class CertLockApp:
                 f"⚠ 需要重启计算机才能完全生效。"
             )
             self.status_label.config(text=f"已封禁: {o} | 重启后生效")
+            self._add_history("cert_block", thumbprint, o if o else cn)
         else:
             messagebox.showerror(
                 "封禁失败",
                 "写入注册表失败。请以管理员身份运行本程序。"
             )
             self.status_label.config(text="封禁失败 — 请检查管理员权限")
-
-        self.refresh_list()
-
-    def on_remove(self):
-        """Remove the selected certificate rule."""
-        selection = self.tree.selection()
-        if not selection:
-            messagebox.showinfo("提示", "请先在列表中选择要移除的证书规则。")
-            return
-
-        item = self.tree.item(selection[0])
-        thumbprint = item['values'][0]
-        description = item['values'][1]
-
-        if thumbprint == "(空)":
-            return
-
-        confirm = messagebox.askyesno(
-            "确认移除",
-            f"确定要移除以下证书封禁规则？\n\n"
-            f"  指纹: {thumbprint[:40]}...\n"
-            f"  描述: {description}\n\n"
-            f"移除后，该厂商的软件将可以正常运行。"
-        )
-        if not confirm:
-            return
-
-        success = reg_remove_cert(thumbprint)
-        if success:
-            messagebox.showinfo("移除成功", "证书规则已移除。重启后生效。")
-            self.status_label.config(text="已移除证书规则 | 重启后生效")
-        else:
-            messagebox.showerror("移除失败", "无法移除该规则。请检查管理员权限。")
 
         self.refresh_list()
 
@@ -1605,6 +1817,7 @@ class CertLockApp:
                     f"⚠ 需要重启计算机才能完全生效。"
                 )
                 self.status_label.config(text=f"已封禁: {label} | 重启后生效")
+                self._add_history("cert_block", thumbprints[0], label)
             else:
                 messagebox.showerror("封禁失败", "请以管理员身份运行本程序。")
 
@@ -1661,25 +1874,737 @@ class CertLockApp:
                 f"⚠ 需要重启计算机才能完全生效。"
             )
             self.status_label.config(text=f"已封禁: {label} | 重启后生效")
+            self._add_history("cert_block", thumbprint, label)
         else:
             messagebox.showerror("封禁失败", "请以管理员身份运行本程序。")
 
         self.refresh_list()
 
+    # ============================================================
+    # Hash Rule UI
+    # ============================================================
+    def on_toggle_view(self):
+        """Toggle between certificate and hash rule views."""
+        self.show_hashes = not self.show_hashes
+        if self.show_hashes:
+            self.list_title.config(text="已封禁哈希列表")
+            self.btn_toggle_view.config(text="查看证书规则")
+            self.btn_block.pack_forget()
+            self.btn_block_hash.pack(side=tk.LEFT, padx=(0, 6))
+            self.btn_export.pack_forget()
+            before_widget = self.btn_template_import
+            self.btn_block_hash.pack(
+                side=tk.LEFT, padx=(0, 6), before=self.btn_remove
+            )
+        else:
+            self.list_title.config(text="已封禁证书列表")
+            self.btn_toggle_view.config(text="查看哈希规则")
+            self.btn_block_hash.pack_forget()
+            self.btn_block.pack(side=tk.LEFT, padx=(0, 6), before=self.btn_remove)
+            self.btn_export.pack(side=tk.RIGHT, padx=(6, 0), before=self.btn_template_export)
+        self.refresh_list()
 
-# ============================================================
-# Entry Point
-# ============================================================
+    def on_block_hash(self):
+        """Block an unsigned file by SHA256 hash."""
+        filepath = filedialog.askopenfilename(
+            title="选择要封禁的文件",
+            filetypes=[
+                ("可执行文件", "*.exe;*.dll;*.msi"),
+                ("所有文件", "*.*"),
+            ]
+        )
+        if not filepath:
+            return
+
+        self.status_label.config(text=f"正在计算哈希: {os.path.basename(filepath)}...")
+        self.root.update()
+
+        try:
+            sha256 = _compute_sha256(filepath)
+        except Exception as e:
+            messagebox.showerror("哈希计算失败", str(e))
+            self.status_label.config(text="哈希计算失败")
+            return
+
+        fname = os.path.basename(filepath)
+        desc = f"Block {fname} (SHA256)"
+
+        confirm = messagebox.askyesno(
+            "确认哈希封禁",
+            f"即将按 SHA256 哈希封禁此文件：\n\n"
+            f"  文件名: {fname}\n"
+            f"  SHA256 : {sha256[:40]}...\n\n"
+            f"注意：哈希封禁仅阻止此精确文件。\n"
+            f"若软件更新，需重新封禁新版本。\n\n"
+            f"⚠ 需要重启计算机才能完全生效。\n\n"
+            f"确定继续？"
+        )
+        if not confirm:
+            self.status_label.config(text="已取消")
+            return
+
+        success = reg_add_hash(filepath, desc)
+        if success:
+            self._add_history("hash_block", sha256, fname)
+            messagebox.showinfo(
+                "封禁成功",
+                f"哈希规则已写入！\n\n"
+                f"  文件: {fname}\n"
+                f"  SHA256: {sha256[:40]}...\n\n"
+                f"⚠ 需要重启计算机才能完全生效。"
+            )
+            self.status_label.config(text=f"已封禁(哈希): {fname} | 重启后生效")
+        else:
+            messagebox.showerror("封禁失败", "写入注册表失败。请以管理员身份运行。")
+            self.status_label.config(text="封禁失败 — 请检查管理员权限")
+
+        self.refresh_list()
+
+    # ============================================================
+    # Community Template UI
+    # ============================================================
+    def on_export_template(self):
+        """Export selected rules as a community template."""
+        from datetime import datetime
+
+        # Collect selected cert
+        certs = reg_list_certs()
+        hashes = reg_list_hashes()
+        if not certs and not hashes:
+            messagebox.showinfo("无规则", "当前没有任何封禁规则。")
+            return
+
+        # Ask which to export
+        result = messagebox.askyesnocancel(
+            "导出社区模板",
+            f"当前共有 {len(certs)} 条证书规则 + {len(hashes)} 条哈希规则。\n\n"
+            f"  · 是 = 导出全部\n"
+            f"  · 否 = 仅导出选中\n"
+            f"  · 取消 = 不导出"
+        )
+        if result is None:
+            return
+
+        entries = []
+        if result:
+            # Export all
+            for c in certs:
+                entries.append({
+                    'type': 'cert', 'thumbprint': c['thumbprint'],
+                    'description': c['description'],
+                    'cert_data': c.get('cert_data', ''),
+                })
+            for h in hashes:
+                entries.append({
+                    'type': 'hash', 'hash': h['hash'],
+                    'description': h['description'],
+                })
+        else:
+            # Export selected only
+            selection = self.tree.selection()
+            if not selection:
+                messagebox.showinfo("提示", "请先在列表中选择要导出的规则。")
+                return
+            existing_certs = {c['thumbprint']: c for c in certs}
+            existing_hashes = {h['hash']: h for h in hashes}
+            for sel in selection:
+                item = self.tree.item(sel)
+                val = item['values'][0]
+                desc = item['values'][1]
+                if val in existing_certs:
+                    c = existing_certs[val]
+                    entries.append({
+                        'type': 'cert', 'thumbprint': c['thumbprint'],
+                        'description': desc, 'cert_data': c.get('cert_data', ''),
+                    })
+                elif val in existing_hashes:
+                    entries.append({
+                        'type': 'hash', 'hash': val,
+                        'description': desc,
+                    })
+
+        if not entries:
+            messagebox.showinfo("提示", "没有可导出的规则。")
+            return
+
+        filename = filedialog.asksaveasfilename(
+            title="导出社区模板到...",
+            defaultextension=".json",
+            filetypes=[("JSON 文件", "*.json"), ("所有文件", "*.*")],
+            initialfile=f"CertLock_template_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+        )
+        if not filename:
+            return
+
+        try:
+            count = export_community_template(filename, entries)
+            messagebox.showinfo("导出成功", f"模板已导出: {count} 条规则 →\n{filename}")
+            self.status_label.config(text=f"模板已导出: {os.path.basename(filename)}")
+        except Exception as e:
+            messagebox.showerror("导出失败", str(e))
+
+    def on_import_template(self):
+        """Import rules from a community template JSON."""
+        from datetime import datetime
+        filepath = filedialog.askopenfilename(
+            title="选择社区模板文件",
+            filetypes=[("JSON 文件", "*.json"), ("所有文件", "*.*")]
+        )
+        if not filepath:
+            return
+
+        try:
+            with open(filepath, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+        except Exception as e:
+            messagebox.showerror("读取失败", f"无法读取模板文件:\n{str(e)}")
+            return
+
+        rules = data.get('rules', [])
+        if not rules:
+            messagebox.showinfo("空模板", "模板文件中没有封禁规则。")
+            return
+
+        vendor_info = data.get('vendor_info', {})
+        vendor_name = vendor_info.get('name', '未知')
+        fmt_ver = data.get('format_version', '未知')
+
+        cert_count = sum(1 for r in rules if r.get('type', 'cert') == 'cert')
+        hash_count = sum(1 for r in rules if r.get('type') == 'hash')
+
+        confirm = messagebox.askyesno(
+            "确认导入",
+            f"模板信息:\n"
+            f"  格式版本: {fmt_ver}\n"
+            f"  来源厂商: {vendor_name}\n"
+            f"  证书规则: {cert_count} 条\n"
+            f"  哈希规则: {hash_count} 条\n"
+            f"  导出者: {data.get('exported_by', '未知')}\n\n"
+            f"将导入 {len(rules)} 条规则。\n"
+            f"⚠ 需要重启计算机才能完全生效。\n\n"
+            f"确定导入？"
+        )
+        if not confirm:
+            return
+
+        added_cert, added_hash, skipped, errors = import_community_template(filepath)
+        msg = f"导入完成:\n  证书: +{added_cert} 条\n  哈希: +{added_hash} 条\n  已存在跳过: {skipped} 条"
+        if errors:
+            msg += f"\n  失败: {errors} 条"
+        messagebox.showinfo("导入结果", msg)
+        self.status_label.config(
+            text=f"模板导入完成 — 证书+{added_cert}, 哈希+{added_hash}"
+        )
+        if added_cert or added_hash:
+            self._add_history("template_import", "", f"+{added_cert}C +{added_hash}H")
+        self.refresh_list()
+
+    # ============================================================
+    # Operation History
+    # ============================================================
+    def _add_history(self, action, rule_id, description=""):
+        """Record an operation in history."""
+        from datetime import datetime
+        entry = {
+            'time': datetime.now().strftime('%H:%M:%S'),
+            'action': action,
+            'rule_id': rule_id,
+            'description': description or rule_id,
+        }
+        self.history.append(entry)
+        self._refresh_history_panel()
+
+    def _refresh_history_panel(self):
+        """Rebuild the history content display."""
+        # Clear old labels
+        for lbl in self.history_labels:
+            lbl.destroy()
+        self.history_labels.clear()
+
+        if not self.history:
+            self.history_count_lbl.config(text="无记录")
+            self.btn_undo_last.pack_forget()
+            return
+
+        self.history_count_lbl.config(text=f"({len(self.history)} 条)")
+        self.btn_undo_last.pack(side=tk.RIGHT)
+
+        if not self._history_visible:
+            return
+
+        # Show entries in reverse (newest first)
+        h_bg = '#252526' if self.is_dark else '#f8f9fa'
+        h_fg = '#d4d4d4' if self.is_dark else '#333333'
+        action_map = {
+            'cert_block': '🔒 证书封禁',
+            'cert_remove': '🔓 证书解封',
+            'hash_block': '🔒 哈希封禁',
+            'hash_remove': '🔓 哈希解封',
+            'template_import': '📥 模板导入',
+        }
+        for entry in reversed(list(self.history)):
+            action_text = action_map.get(entry['action'], entry['action'])
+            text = f"  {entry['time']}  {action_text}  —  {entry['description'][:60]}"
+            lbl = tk.Label(
+                self.history_content, text=text,
+                bg=h_bg, fg=h_fg, font=("Consolas", 8),
+                anchor=tk.W, justify=tk.LEFT
+            )
+            lbl.pack(fill=tk.X, padx=12, pady=1)
+            self.history_labels.append(lbl)
+
+    def _toggle_history(self):
+        """Show/hide the operation history panel."""
+        self._history_visible = not self._history_visible
+        if self._history_visible:
+            self.history_toggle_btn.config(text="▼ 最近操作")
+            self.history_content.pack(fill=tk.X)
+            self._refresh_history_panel()
+            self.history_frame.pack(
+                fill=tk.X, side=tk.BOTTOM,
+                before=self._status_separator
+            )
+        else:
+            self.history_toggle_btn.config(text="▶ 最近操作")
+            self.history_content.pack_forget()
+            # Clear content labels
+            for lbl in self.history_labels:
+                lbl.destroy()
+            self.history_labels.clear()
+
+    def _undo_last(self):
+        """Undo the most recent operation."""
+        if not self.history:
+            messagebox.showinfo("提示", "没有可撤销的操作。")
+            return
+
+        last = self.history.pop()
+        action = last['action']
+        rule_id = last['rule_id']
+
+        if action == 'cert_block':
+            confirm = messagebox.askyesno(
+                "撤销封禁",
+                f"将移除刚添加的证书封禁：\n"
+                f"  {rule_id[:40]}...\n\n确定撤销？"
+            )
+            if confirm:
+                if reg_remove_cert(rule_id):
+                    self.status_label.config(text="已撤销: 证书封禁")
+                    self._add_history("cert_remove", rule_id, "撤销封禁")
+                else:
+                    messagebox.showerror("撤销失败", "无法移除该规则。")
+        elif action == 'hash_block':
+            confirm = messagebox.askyesno(
+                "撤销封禁",
+                f"将移除刚添加的哈希封禁：\n"
+                f"  {rule_id[:40]}...\n\n确定撤销？"
+            )
+            if confirm:
+                if reg_remove_hash(rule_id):
+                    self.status_label.config(text="已撤销: 哈希封禁")
+                    self._add_history("hash_remove", rule_id, "撤销封禁")
+                else:
+                    messagebox.showerror("撤销失败", "无法移除该规则。")
+        elif action == 'cert_remove':
+            messagebox.showinfo("提示", "解封操作不支持撤销。请通过「封禁新证书」重新封禁。")
+            return
+        else:
+            messagebox.showinfo("提示", "此操作不支持自动撤销。")
+            self.history.append(last)  # Put it back
+            return
+
+        self.history.pop()  # Remove the undo entry we just added
+        self._refresh_history_panel()
+        self.refresh_list()
+
+    # ============================================================
+    # Override: refresh_list with hash support
+    # ============================================================
+    def refresh_list(self):
+        """Refresh the list from registry (certs or hashes depending on view)."""
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+
+        if self.show_hashes:
+            # Hash view
+            rules = reg_list_hashes()
+            self.tree.heading("thumbprint", text="SHA256 哈希")
+            self.tree.heading("description", text="描述")
+            self.tree.heading("status", text="状态")
+            self.tree.column("thumbprint", width=400, minwidth=250)
+            if not rules:
+                self.tree.insert("", tk.END, values=(
+                    "(空)", "尚未封禁任何哈希规则", ""
+                ))
+                self.status_label.config(text="未检测到哈希封禁规则")
+            else:
+                for r in rules:
+                    status_text = "已阻止" if r['disallowed'] else "已允许"
+                    self.tree.insert("", tk.END, values=(
+                        r['hash'], r['description'], status_text
+                    ))
+                self.status_label.config(text=f"共 {len(rules)} 个哈希规则 | 重启后完全生效")
+        else:
+            # Cert view (original)
+            certs = reg_list_certs()
+            self.tree.heading("thumbprint", text="证书指纹 (Thumbprint)")
+            self.tree.heading("description", text="描述")
+            self.tree.heading("status", text="状态")
+            self.tree.column("thumbprint", width=290, minwidth=200)
+            if not certs:
+                self.tree.insert("", tk.END, values=(
+                    "(空)", "尚未封禁任何证书", ""
+                ))
+                self.status_label.config(
+                    text="未检测到已封禁证书 | 点击「封禁新证书」或下方预设"
+                )
+            else:
+                for c in certs:
+                    status_text = "已阻止" if c['disallowed'] else "已允许"
+                    self.tree.insert("", tk.END, values=(
+                        c['thumbprint'],
+                        c['description'],
+                        status_text
+                    ))
+                self.status_label.config(
+                    text=f"共 {len(certs)} 个证书规则 | 重启后完全生效"
+                )
+
+        # Update policy status
+        if reg_is_policy_active():
+            self.policy_label.config(
+                text="策略: 已启用",
+                foreground="#4ec94e" if self.is_dark else "green"
+            )
+        else:
+            self.policy_label.config(
+                text="策略: 未配置",
+                foreground="#f44747" if self.is_dark else "red"
+            )
+
+        # Show/hide restart warning banner
+        certs = reg_list_certs()
+        hashes = reg_list_hashes()
+        if certs or hashes:
+            self.restart_banner.pack(
+                fill=tk.X, side=tk.BOTTOM,
+                before=self._status_separator
+            )
+        else:
+            self.restart_banner.pack_forget()
+
+        # Show/hide cert data missing banner
+        is_frozen = getattr(sys, 'frozen', False)
+        if not is_frozen and not PRESET_CERT_DATA:
+            self.certdata_banner.pack(
+                fill=tk.X, side=tk.BOTTOM,
+                before=self._status_separator
+            )
+        else:
+            self.certdata_banner.pack_forget()
+
+        # Update preset button states (only in cert view)
+        if not self.show_hashes:
+            self._update_preset_states()
+
+    # ============================================================
+    # Override: on_remove with hash support
+    # ============================================================
+    def on_remove(self):
+        """Remove the selected rule (cert or hash)."""
+        selection = self.tree.selection()
+        if not selection:
+            messagebox.showinfo("提示", "请先在列表中选择要移除的规则。")
+            return
+
+        item = self.tree.item(selection[0])
+        rule_id = item['values'][0]
+        description = item['values'][1]
+
+        if rule_id == "(空)":
+            return
+
+        rule_type = "哈希" if self.show_hashes else "证书"
+        confirm = messagebox.askyesno(
+            "确认移除",
+            f"确定要移除以下{rule_type}封禁规则？\n\n"
+            f"  ID: {rule_id[:40]}...\n"
+            f"  描述: {description}\n\n"
+            f"移除后，该规则将不再阻止软件运行。"
+        )
+        if not confirm:
+            return
+
+        if self.show_hashes:
+            success = reg_remove_hash(rule_id)
+            if success:
+                self._add_history("hash_remove", rule_id, description)
+        else:
+            success = reg_remove_cert(rule_id)
+            if success:
+                self._add_history("cert_remove", rule_id, description)
+
+        if success:
+            messagebox.showinfo("移除成功", f"{rule_type}规则已移除。重启后生效。")
+            self.status_label.config(text=f"已移除{rule_type}规则 | 重启后生效")
+        else:
+            messagebox.showerror("移除失败", "无法移除该规则。请检查管理员权限。")
+
+        self.refresh_list()
+def _parse_args():
+    """Parse command-line arguments."""
+    parser = argparse.ArgumentParser(
+        prog='certlock',
+        description=f'{APP_NAME} v{APP_VERSION} — Windows 软件封禁工具',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog='''
+示例:
+  certlock                              # 启动 GUI
+  certlock --block "C:\\path\\app.exe"  # 提取证书并封禁
+  certlock --hash "C:\\path\\app.exe"   # 按 SHA256 哈希封禁(无签名软件)
+  certlock --list                       # 列出所有规则
+  certlock --remove <指纹或哈希>        # 移除指定规则
+  certlock --export backup.json         # 导出全部规则
+  certlock --import backup.json         # 导入规则
+  certlock --template-export t.json     # 导出社区模板
+  certlock --template-import t.json     # 导入社区模板
+        ''')
+    parser.add_argument('--block', metavar='FILE',
+                       help='提取签名证书并封禁')
+    parser.add_argument('--hash', metavar='FILE',
+                       help='按 SHA256 哈希封禁文件（无签名软件）')
+    parser.add_argument('--remove', metavar='ID',
+                       help='移除指定证书指纹或 SHA256 哈希')
+    parser.add_argument('--list', action='store_true',
+                       help='列出所有已封禁规则')
+    parser.add_argument('--export', metavar='FILE',
+                       help='导出全部规则为 JSON')
+    parser.add_argument('--import', metavar='FILE', dest='import_file',
+                       help='从 JSON 备份导入规则')
+    parser.add_argument('--template-export', metavar='FILE',
+                       help='导出社区模板 JSON')
+    parser.add_argument('--template-import', metavar='FILE',
+                       help='导入社区模板 JSON')
+    parser.add_argument('--version', action='version',
+                       version=f'{APP_NAME} v{APP_VERSION}')
+    return parser.parse_args()
+
+
+def _cli_list():
+    """CLI: list all rules."""
+    certs = reg_list_certs()
+    hashes = reg_list_hashes()
+    if not certs and not hashes:
+        print("当前没有任何封禁规则。")
+        return
+    if certs:
+        print(f"\n=== 证书规则 ({len(certs)} 条) ===")
+        for c in certs:
+            status = "已阻止" if c['disallowed'] else "已允许"
+            print(f"  {c['thumbprint']}  {status}")
+            print(f"    {c['description']}")
+    if hashes:
+        print(f"\n=== 哈希规则 ({len(hashes)} 条) ===")
+        for h in hashes:
+            status = "已阻止" if h['disallowed'] else "已允许"
+            print(f"  {h['hash']}  {status}")
+            print(f"    {h['description']}")
+
+
+def _cli_remove(rule_id):
+    """CLI: remove a rule by cert thumbprint or SHA256 hash."""
+    rule_id = rule_id.strip().upper()
+    # Try cert first
+    certs = reg_list_certs()
+    for c in certs:
+        if c['thumbprint'].upper() == rule_id:
+            if reg_remove_cert(c['thumbprint']):
+                print(f"已移除证书规则: {c['description']}")
+            else:
+                print("移除失败（请以管理员身份运行）")
+            return
+    # Try hash
+    hashes = reg_list_hashes()
+    for h in hashes:
+        if h['hash'].upper() == rule_id:
+            if reg_remove_hash(h['hash']):
+                print(f"已移除哈希规则: {h['description']}")
+            else:
+                print("移除失败（请以管理员身份运行）")
+            return
+    print(f"未找到规则: {rule_id}")
+
+
+def _cli_block(filepath):
+    """CLI: block by cert extraction."""
+    info = extract_cert_from_exe(filepath)
+    if 'error' in info:
+        print(f"错误: {info.get('error_msg', info['error'])}")
+        return
+    thumbprint = info.get('THUMBPRINT', '')
+    o = info.get('O', '')
+    desc = f"Block all software signed by {o}"
+    if reg_add_cert(thumbprint, info.get('cert_blob', ''), desc):
+        print(f"已封禁: {o}")
+        print(f"指纹: {thumbprint}")
+        print("⚠ 需要重启计算机才能完全生效。")
+    else:
+        print("封禁失败（请以管理员身份运行）")
+
+
+def _cli_hash_block(filepath):
+    """CLI: block by SHA256 hash."""
+    sha256 = _compute_sha256(filepath)
+    fname = os.path.basename(filepath)
+    desc = f"Block {fname} (SHA256: {sha256[:16]}...)"
+    if reg_add_hash(filepath, desc):
+        print(f"已封禁(哈希): {fname}")
+        print(f"SHA256: {sha256}")
+        print("⚠ 需要重启计算机才能完全生效。")
+    else:
+        print("封禁失败（请以管理员身份运行）")
+
+
+def _cli_export(filepath):
+    """CLI: export all rules to JSON."""
+    from datetime import datetime
+    rules = reg_export_all_rules()
+    # Also export hash rules
+    hashes = reg_list_hashes()
+    rules['hash_rules'] = []
+    for h in hashes:
+        rules['hash_rules'].append({
+            'sha256': h['hash'],
+            'description': h['description'],
+            'disallowed': h['disallowed'],
+        })
+    rules['exported_at'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    with open(filepath, 'w', encoding='utf-8') as f:
+        json.dump(rules, f, indent=2, ensure_ascii=False)
+    print(f"已导出 {len(rules.get('certificates', []))} 条证书规则 + "
+          f"{len(rules.get('hash_rules', []))} 条哈希规则 → {filepath}")
+
+
+def _cli_import(filepath):
+    """CLI: import rules from JSON backup."""
+    with open(filepath, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+    success, skipped, errors = reg_import_rules(data)
+    print(f"证书规则: 写入 {success}, 跳过 {skipped}, 失败 {errors}")
+    # Import hash rules if present
+    if 'hash_rules' in data:
+        h_added = 0
+        h_skipped = 0
+        existing = {h['hash'].upper() for h in reg_list_hashes()}
+        for hr in data['hash_rules']:
+            h = hr.get('sha256', '')
+            if not h:
+                continue
+            if h.upper() in existing:
+                h_skipped += 1
+                continue
+            if reg_add_hash(h, hr.get('description', '')):
+                h_added += 1
+        print(f"哈希规则: 写入 {h_added}, 跳过 {h_skipped}")
+    print("⚠ 需要重启计算机才能完全生效。")
+
+
+def _cli_template_export(filepath):
+    """CLI: export community template."""
+    from datetime import datetime
+    certs = reg_list_certs()
+    hashes = reg_list_hashes()
+    entries = []
+    for c in certs:
+        entries.append({
+            'type': 'cert',
+            'thumbprint': c['thumbprint'],
+            'description': c['description'],
+            'cert_data': c.get('cert_data', ''),
+        })
+    for h in hashes:
+        entries.append({
+            'type': 'hash',
+            'hash': h['hash'],
+            'description': h['description'],
+        })
+    count = export_community_template(filepath, entries)
+    print(f"社区模板已导出: {count} 条规则 → {filepath}")
+
+
+def _cli_template_import(filepath):
+    """CLI: import community template."""
+    added_cert, added_hash, skipped, errors = import_community_template(filepath)
+    print(f"证书: +{added_cert}  哈希: +{added_hash}  跳过: {skipped}  失败: {errors}")
+    print("⚠ 需要重启计算机才能完全生效。")
+
+
+def _run_cli(args):
+    """Execute CLI commands based on parsed args."""
+    has_action = False
+
+    if args.list:
+        _cli_list()
+        has_action = True
+
+    if args.remove:
+        _cli_remove(args.remove)
+        has_action = True
+
+    if args.block:
+        _cli_block(args.block)
+        has_action = True
+
+    if args.hash:
+        _cli_hash_block(args.hash)
+        has_action = True
+
+    if args.export:
+        _cli_export(args.export)
+        has_action = True
+
+    if args.import_file:
+        _cli_import(args.import_file)
+        has_action = True
+
+    if args.template_export:
+        _cli_template_export(args.template_export)
+        has_action = True
+
+    if args.template_import:
+        _cli_template_import(args.template_import)
+        has_action = True
+
+    if not has_action:
+        print("请指定操作。使用 --help 查看可用选项。")
+
+
 def main():
-    # Require admin
+    # Parse args — if any action flag is set, run CLI mode
+    args = _parse_args()
+    has_cli_action = any([
+        args.list, args.remove, args.block, args.hash,
+        args.export, args.import_file,
+        args.template_export, args.template_import,
+    ])
+
+    if has_cli_action:
+        # CLI mode
+        if not is_admin():
+            print("需要管理员权限。请右键 → 以管理员身份运行。")
+            sys.exit(1)
+        load_preset_cert_data()
+        _run_cli(args)
+        return
+
+    # GUI mode
     if not is_admin():
         elevate()
         sys.exit(0)
 
-    # Load embedded cert data
     load_preset_cert_data()
 
-    # Launch GUI
     root = tk.Tk()
     app = CertLockApp(root)
     root.mainloop()
