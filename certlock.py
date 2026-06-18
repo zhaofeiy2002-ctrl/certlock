@@ -270,6 +270,7 @@ def reg_open_srp(mode="r"):
 def reg_list_certs():
     """List all blocked certificate rules. Returns list of dicts."""
     results = []
+    srp = certs = None
     try:
         srp = reg_open_srp("r")
         if srp is None:
@@ -280,7 +281,6 @@ def reg_list_certs():
                 winreg.HKEY_LOCAL_MACHINE, CERT_RULES, 0, winreg.KEY_READ
             )
         except FileNotFoundError:
-            winreg.CloseKey(srp)
             return results
 
         # Enumerate subkeys (each is a certificate rule)
@@ -316,17 +316,19 @@ def reg_list_certs():
                 idx += 1
             except OSError:
                 break
-
-        winreg.CloseKey(certs)
-        winreg.CloseKey(srp)
     except Exception as e:
-        import sys
         print(f"[CertLock] reg_list_certs failed: {e}", file=sys.stderr)
+    finally:
+        if certs:
+            winreg.CloseKey(certs)
+        if srp:
+            winreg.CloseKey(srp)
     return results
 
 
 def reg_add_cert(thumbprint, cert_blob_b64, description):
     """Add a certificate rule to block. Returns True on success."""
+    srp = certs = rule = None
     try:
         srp = reg_open_srp("w")
         # Ensure Certificates container exists
@@ -345,22 +347,23 @@ def reg_add_cert(thumbprint, cert_blob_b64, description):
         winreg.SetValueEx(rule, "SaferFlags", 0, winreg.REG_DWORD, 0)
         winreg.SetValueEx(rule, "Description", 0, winreg.REG_SZ, description)
 
-        winreg.CloseKey(rule)
-        winreg.CloseKey(certs)
-        winreg.CloseKey(srp)
-
         # Refresh group policy
         subprocess.run(
             ["gpupdate", "/force", "/target:computer"],
             capture_output=True, timeout=30
         )
         return True
-    except Exception as e:
+    except Exception:
         return False
+    finally:
+        for h in (rule, certs, srp):
+            if h:
+                winreg.CloseKey(h)
 
 
 def reg_remove_cert(thumbprint):
     """Remove a certificate rule. Returns True on success."""
+    key = rule = None
     try:
         rule_path = f"{CERT_RULES}\\{thumbprint}"
         # Check if exists
@@ -390,20 +393,22 @@ def reg_remove_cert(thumbprint):
                     winreg.DeleteValue(rule, name)
                 except OSError:
                     break
-            winreg.CloseKey(rule)
         except Exception:
             pass
 
         winreg.DeleteKey(key, thumbprint)
-        winreg.CloseKey(key)
 
         subprocess.run(
             ["gpupdate", "/force", "/target:computer"],
             capture_output=True, timeout=30
         )
         return True
-    except Exception as e:
+    except Exception:
         return False
+    finally:
+        for h in (rule, key):
+            if h:
+                winreg.CloseKey(h)
 
 
 def reg_is_policy_active():
@@ -512,6 +517,7 @@ def _compute_sha256(filepath):
 def reg_list_hashes():
     """List all hash rules. Returns list of dicts."""
     results = []
+    srp = hashes_key = None
     try:
         srp = reg_open_srp("r")
         if srp is None:
@@ -521,7 +527,6 @@ def reg_list_hashes():
                 winreg.HKEY_LOCAL_MACHINE, HASH_RULES, 0, winreg.KEY_READ
             )
         except FileNotFoundError:
-            winreg.CloseKey(srp)
             return results
 
         idx = 0
@@ -555,12 +560,13 @@ def reg_list_hashes():
                 idx += 1
             except OSError:
                 break
-
-        winreg.CloseKey(hashes_key)
-        winreg.CloseKey(srp)
     except Exception as e:
-        import sys
         print(f"[CertLock] reg_list_hashes failed: {e}", file=sys.stderr)
+    finally:
+        if hashes_key:
+            winreg.CloseKey(hashes_key)
+        if srp:
+            winreg.CloseKey(srp)
     return results
 
 
@@ -576,12 +582,14 @@ def reg_add_hash(filepath_or_hash, description):
         except Exception:
             return False
 
+    rule = None
     try:
         # Ensure Hashes container exists
         try:
-            winreg.OpenKey(
+            h = winreg.OpenKey(
                 winreg.HKEY_LOCAL_MACHINE, HASH_RULES, 0, winreg.KEY_ALL_ACCESS
             )
+            winreg.CloseKey(h)
         except FileNotFoundError:
             winreg.CreateKey(winreg.HKEY_LOCAL_MACHINE, HASH_RULES)
 
@@ -592,7 +600,6 @@ def reg_add_hash(filepath_or_hash, description):
         winreg.SetValueEx(rule, "ItemData", 0, winreg.REG_BINARY, b'\x00' * 20)
         winreg.SetValueEx(rule, "SaferFlags", 0, winreg.REG_DWORD, 0)
         winreg.SetValueEx(rule, "Description", 0, winreg.REG_SZ, description)
-        winreg.CloseKey(rule)
 
         # Refresh policy
         subprocess.run(["gpupdate", "/target:computer", "/force"],
@@ -600,10 +607,14 @@ def reg_add_hash(filepath_or_hash, description):
         return True
     except Exception:
         return False
+    finally:
+        if rule:
+            winreg.CloseKey(rule)
 
 
 def reg_remove_hash(sha256):
     """Remove a hash rule. Returns True on success."""
+    rule = parent = None
     try:
         rule_path = f"{HASH_RULES}\\{sha256}"
         # Delete values first, then key
@@ -617,7 +628,6 @@ def reg_remove_hash(sha256):
                     winreg.DeleteValue(rule, name)
                 except FileNotFoundError:
                     pass
-            winreg.CloseKey(rule)
         except FileNotFoundError:
             pass
 
@@ -627,13 +637,16 @@ def reg_remove_hash(sha256):
             winreg.KEY_ALL_ACCESS | winreg.KEY_WOW64_64KEY
         )
         winreg.DeleteKey(parent, sha256)
-        winreg.CloseKey(parent)
 
         subprocess.run(["gpupdate", "/target:computer", "/force"],
                        capture_output=True, timeout=30)
         return True
     except Exception:
         return False
+    finally:
+        for h in (rule, parent):
+            if h:
+                winreg.CloseKey(h)
 
 
 # ============================================================
