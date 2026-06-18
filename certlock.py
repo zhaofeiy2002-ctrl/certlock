@@ -26,7 +26,7 @@ from tkinter import ttk, messagebox, filedialog
 # Constants
 # ============================================================
 APP_NAME    = "CertLock"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.2.0"
 SRP_ROOT    = r"SOFTWARE\Policies\Microsoft\Windows\Safer\CodeIdentifiers"
 CERT_RULES  = f"{SRP_ROOT}\\0\\Certificates"
 
@@ -40,11 +40,14 @@ CERT_PRESETS = {
         "cert_data":  True,  # Embedded in presets_data dict below
     },
     "金山 (WPS/毒霸)": {
-        "thumbprint": "",
-        "vendor":     "Zhuhai Kingsoft Office Software Co., Ltd.",
+        "thumbprint": "91F82992D80651CDACF4D96A307F8434BA5838CC",
+        "thumbprints": [
+            "91F82992D80651CDACF4D96A307F8434BA5838CC",
+            "C1E3BDD81C9A773163D5B47A7F50111EE00CBF71",
+        ],
+        "vendor":     "Beijing Kingsoft Security software Co.,Ltd",
         "products":   "WPS Office / 金山毒霸 / 金山卫士 / 驱动精灵",
-        "cert_data":  False,  # Requires user to provide signed .exe
-        "find_hint":  "安装 WPS 后提取: C:\\Program Files\\WPS Office\\wps.exe",
+        "cert_data":  True,  # Embedded certs from kinsthomeui + DGSetup
     },
     "鲁大师": {
         "thumbprint": "EC5BB0C4BE5D6F7CD9D863D6585CF1F3EF58FDA0",
@@ -68,11 +71,10 @@ CERT_PRESETS = {
         "find_hint":  "下载驱动精灵安装包 (不安装)，用本工具提取证书",
     },
     "2345": {
-        "thumbprint": "",
+        "thumbprint": "AC3C08A55AB1F2700909A5B423DB4A35508D83B4",
         "vendor":     "Shanghai 2345 Mobile Technology Co., Ltd.",
         "products":   "2345浏览器 / 2345好压 / 2345看图王 / 2345安全卫士",
-        "cert_data":  False,
-        "find_hint":  "下载任意2345软件安装包 (不安装)，用本工具提取证书",
+        "cert_data":  True,  # Embedded cert from 2345explorer installer
     },
 }
 
@@ -360,6 +362,9 @@ def load_preset_cert_data():
         "7913DE9D7ED4EEEE790FF0680A4C802C1BC832AB": "cert_360_b64.txt",
         "EC5BB0C4BE5D6F7CD9D863D6585CF1F3EF58FDA0": "cert_ludashi_b64.txt",
         "0A518324A48A250A4579DC9E96539CB44725B38C": "cert_tencent_b64.txt",
+        "91F82992D80651CDACF4D96A307F8434BA5838CC": "cert_kingsoft_b64.txt",
+        "C1E3BDD81C9A773163D5B47A7F50111EE00CBF71": "cert_kingsoft_dg_b64.txt",
+        "AC3C08A55AB1F2700909A5B423DB4A35508D83B4": "cert_2345_b64.txt",
     }
 
     for thumbprint, filename in _CERT_FILES.items():
@@ -794,58 +799,83 @@ class CertLockApp:
 
     def on_preset_click(self, label, preset):
         """Handle preset button click."""
-        thumbprint = preset.get("thumbprint", "")
+        # Support both single thumbprint and multiple thumbprints per preset
+        thumbprints = preset.get("thumbprints", [])
+        if not thumbprints:
+            tp = preset.get("thumbprint", "")
+            if tp:
+                thumbprints = [tp]
 
-        # Check if already blocked
+        # If no thumbprints at all, need user to provide .exe
+        if not thumbprints:
+            self._prompt_for_exe(label, preset)
+            return
+
+        # Check if ALL thumbprints are already blocked
         existing = reg_list_certs()
-        already_blocked = any(
-            c['thumbprint'].upper() == thumbprint.upper()
-            for c in existing
-        ) if thumbprint else False
+        existing_thumbs = {c['thumbprint'].upper() for c in existing}
+        already_blocked = all(t.upper() in existing_thumbs for t in thumbprints)
 
         if already_blocked:
             messagebox.showinfo(
                 "已封禁",
                 f"{label} 已被封禁，无需重复操作。\n\n"
-                f"指纹: {thumbprint[:40]}..."
+                f"指纹: {thumbprints[0][:40]}..."
             )
             return
 
         has_data = preset.get("cert_data", False)
 
-        if has_data and thumbprint:
-            # Check if we have the actual cert blob
-            cert_blob = PRESET_CERT_DATA.get(thumbprint, "")
-            if cert_blob:
-                # One-click block
-                confirm = messagebox.askyesno(
-                    "一键封禁",
-                    f"将封禁 {label} 所有软件：\n\n"
-                    f"  厂商: {preset['vendor']}\n"
-                    f"  产品: {preset['products']}\n"
-                    f"  指纹: {thumbprint[:40]}...\n\n"
-                    f"确定封禁？"
-                )
-                if not confirm:
-                    return
-
-                desc = f"Block all software signed by {preset['vendor']}"
-                success = reg_add_cert(thumbprint, cert_blob, desc)
-
-                if success:
-                    messagebox.showinfo(
-                        "封禁成功",
-                        f"{label} 已封禁！\n\n"
-                        f"⚠ 需要重启计算机才能完全生效。"
-                    )
-                    self.status_label.config(text=f"已封禁: {label} | 重启后生效")
+        if has_data:
+            # Collect available cert blobs
+            blobs = {}
+            missing = []
+            for tp in thumbprints:
+                blob = PRESET_CERT_DATA.get(tp, "")
+                if blob:
+                    blobs[tp] = blob
                 else:
-                    messagebox.showerror("封禁失败", "请以管理员身份运行本程序。")
+                    missing.append(tp)
 
-                self.refresh_list()
-            else:
-                # Has thumbprint but no blob data - need to extract
+            if not blobs:
+                # No blob data at all - need to extract
                 self._prompt_for_exe(label, preset)
+                return
+
+            # Build confirmation message
+            tp_display = "\n".join(
+                f"  • {tp[:40]}..." for tp in thumbprints
+            )
+            confirm = messagebox.askyesno(
+                "一键封禁",
+                f"将封禁 {label} 所有软件：\n\n"
+                f"  厂商: {preset['vendor']}\n"
+                f"  产品: {preset['products']}\n"
+                f"  证书指纹:\n{tp_display}\n"
+                f"确定封禁？"
+            )
+            if not confirm:
+                return
+
+            # Block all available certs
+            desc = f"Block all software signed by {preset['vendor']}"
+            success_count = 0
+            for tp, blob in blobs.items():
+                if tp.upper() not in existing_thumbs:
+                    if reg_add_cert(tp, blob, desc):
+                        success_count += 1
+
+            if success_count > 0:
+                messagebox.showinfo(
+                    "封禁成功",
+                    f"{label} 已封禁 {success_count} 张证书！\n\n"
+                    f"⚠ 需要重启计算机才能完全生效。"
+                )
+                self.status_label.config(text=f"已封禁: {label} | 重启后生效")
+            else:
+                messagebox.showerror("封禁失败", "请以管理员身份运行本程序。")
+
+            self.refresh_list()
         else:
             # No embedded cert - user must provide signed .exe
             self._prompt_for_exe(label, preset)

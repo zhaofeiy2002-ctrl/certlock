@@ -34,6 +34,9 @@ python -m PyInstaller ^
     --add-data "cert_360_b64.txt;." ^
     --add-data "cert_ludashi_b64.txt;." ^
     --add-data "cert_tencent_b64.txt;." ^
+    --add-data "cert_kingsoft_b64.txt;." ^
+    --add-data "cert_kingsoft_dg_b64.txt;." ^
+    --add-data "cert_2345_b64.txt;." ^
     certlock.py
 
 if %errorlevel% neq 0 (
