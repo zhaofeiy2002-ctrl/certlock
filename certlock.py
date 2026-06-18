@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """
-CertLock v1.0 — Windows Certificate Blocker
-============================================
+CertLock v1.4.0 — Windows Certificate Blocker
+=============================================
 A lightweight GUI tool to block unwanted software via Windows
 Software Restriction Policy (SRP) certificate rules.
+
+Features: cert blocking/unblocking, 6 built-in presets, dark mode,
+          restart warning banner, impact preview, policy backup/restore.
 
 Style: Single-window, portable, no-install, ZyperWin++ aesthetic.
 Requires: Python 3.6+ (tkinter built-in), Windows 10/11
@@ -28,7 +31,7 @@ from tkinter import ttk, messagebox, filedialog
 # Constants
 # ============================================================
 APP_NAME    = "CertLock"
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.4.0"
 SRP_ROOT    = r"SOFTWARE\Policies\Microsoft\Windows\Safer\CodeIdentifiers"
 CERT_RULES  = f"{SRP_ROOT}\\0\\Certificates"
 
@@ -274,6 +277,80 @@ def reg_is_policy_active():
         return False
 
 
+def reg_export_all_rules():
+    """Export all SRP certificate rules as a dict (for backup)."""
+    rules = {
+        'version': APP_VERSION,
+        'exported_at': '',  # filled by caller if needed
+        'default_level': 0,
+        'policy_scope': 0,
+        'authenticodeenabled': 1,
+        'certificates': [],
+    }
+    try:
+        srp = reg_open_srp("r")
+        if srp:
+            try:
+                rules['default_level'], _ = winreg.QueryValueEx(srp, 'DefaultLevel')
+            except Exception:
+                pass
+            try:
+                rules['policy_scope'], _ = winreg.QueryValueEx(srp, 'PolicyScope')
+            except Exception:
+                pass
+            try:
+                rules['authenticodeenabled'], _ = winreg.QueryValueEx(srp, 'authenticodeenabled')
+            except Exception:
+                pass
+            winreg.CloseKey(srp)
+    except Exception:
+        pass
+
+    certs = reg_list_certs()
+    for c in certs:
+        rules['certificates'].append({
+            'thumbprint': c['thumbprint'],
+            'description': c['description'],
+            'disallowed': c['disallowed'],
+            'cert_data': c.get('cert_data', ''),
+        })
+    return rules
+
+
+def reg_import_rules(data):
+    """Import SRP certificate rules from a dict (restore from backup).
+    Returns (success_count, skip_count, error_count)."""
+    success = 0
+    skipped = 0
+    errors = 0
+
+    if not isinstance(data, dict) or 'certificates' not in data:
+        return 0, 0, 1
+
+    existing = reg_list_certs()
+    existing_thumbs = {c['thumbprint'].upper() for c in existing}
+
+    for cert in data.get('certificates', []):
+        tp = cert.get('thumbprint', '')
+        if not tp:
+            errors += 1
+            continue
+        if tp.upper() in existing_thumbs:
+            skipped += 1
+            continue
+        blob = cert.get('cert_data', '')
+        desc = cert.get('description', 'Block all software')
+        if not blob:
+            errors += 1
+            continue
+        if reg_add_cert(tp, blob, desc):
+            success += 1
+        else:
+            errors += 1
+
+    return success, skipped, errors
+
+
 # ============================================================
 # Certificate Extraction (from .exe files)
 # ============================================================
@@ -281,7 +358,15 @@ def extract_cert_from_exe(exe_path):
     """
     Extract digital certificate from a signed PE (.exe/.dll).
     Pure Python implementation — no PowerShell dependency.
-    Returns dict with cert info, or None on failure.
+
+    On success: returns dict with cert info (THUMBPRINT, CN, O, etc.)
+    On failure: returns dict with 'error' key:
+      - 'no_signature'   — PE file has no digital signature
+      - 'not_pe'         — file is not a valid PE (DOS/PE header missing)
+      - 'unsupported'    — signature format not supported
+      - 'file_corrupt'   — file too small or truncated
+      - 'parse_error'    — cert parsing failed (malformed ASN.1 etc.)
+      - 'unknown'        — unclassified error
     """
     try:
         der_bytes, subject, thumbprint, issuer, not_before, not_after = \
@@ -308,8 +393,23 @@ def extract_cert_from_exe(exe_path):
             'BLOB_LEN': str(len(b64)),
             'cert_blob': b64,
         }
-    except Exception:
-        return None
+    except ValueError as e:
+        msg = str(e)
+        if "No digital signature" in msg:
+            return {'error': 'no_signature',    'error_msg': msg}
+        if "Not a valid PE" in msg:
+            return {'error': 'not_pe',          'error_msg': msg}
+        if "Unknown PE magic" in msg or "Not PKCS" in msg:
+            return {'error': 'unsupported',     'error_msg': msg}
+        if "too small" in msg.lower() or "truncated" in msg.lower():
+            return {'error': 'file_corrupt',    'error_msg': msg}
+        if "No certificates found" in msg:
+            return {'error': 'parse_error',     'error_msg': msg}
+        return {'error': 'parse_error',         'error_msg': msg}
+    except OSError as e:
+        return {'error': 'file_corrupt',        'error_msg': str(e)}
+    except Exception as e:
+        return {'error': 'unknown',             'error_msg': str(e)}
 
 
 # ============================================================
@@ -585,6 +685,20 @@ def load_preset_cert_data():
             PRESET_CERT_DATA[thumbprint] = cert_blob
 
 
+def detect_dark_mode():
+    """Detect Windows system dark mode from registry. Returns True if dark."""
+    try:
+        key = winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"
+        )
+        val, _ = winreg.QueryValueEx(key, "AppsUseLightTheme")
+        winreg.CloseKey(key)
+        return val == 0
+    except Exception:
+        return False
+
+
 def get_app_dir():
     """Get the directory containing resources (script dir or PyInstaller temp)."""
     if getattr(sys, 'frozen', False):
@@ -604,17 +718,24 @@ class CertLockApp:
         self.root.minsize(640, 500)
         self.root.resizable(True, True)
 
+        # Detect system theme
+        self.is_dark = detect_dark_mode()
+
         # Set icon (optional)
         try:
             self.root.iconbitmap(default="")
         except Exception:
             pass
 
-        # Styles
+        # Styles (must be before build_ui — dark mode affects colors)
         self.setup_styles()
 
         # Build UI
         self.build_ui()
+
+        # Apply dark mode root background
+        if self.is_dark:
+            self.root.configure(bg='#1e1e1e')
 
         # Load data
         self.refresh_list()
@@ -631,16 +752,65 @@ class CertLockApp:
 
     def setup_styles(self):
         style = ttk.Style()
-        style.theme_use("vista" if "vista" in style.theme_names() else "clam")
+        # Use 'clam' for dark mode (vista doesn't support custom colors well)
+        if self.is_dark:
+            style.theme_use("clam")
+        else:
+            style.theme_use("vista" if "vista" in style.theme_names() else "clam")
 
-        style.configure("Title.TLabel", font=("Segoe UI", 14, "bold"))
-        style.configure("Subtitle.TLabel", font=("Segoe UI", 9))
-        style.configure("Status.TLabel", font=("Segoe UI", 8))
-        style.configure("Preset.TButton", font=("Segoe UI", 9), padding=(8, 4))
+        if self.is_dark:
+            # Dark mode ttk colors
+            style.configure(".", background="#1e1e1e", foreground="#d4d4d4",
+                           fieldbackground="#2d2d30", troughcolor="#2d2d30")
+            style.configure("TFrame", background="#1e1e1e")
+            style.configure("TLabel", background="#1e1e1e", foreground="#d4d4d4")
+            style.configure("TButton", background="#3e3e42", foreground="#d4d4d4",
+                           borderwidth=1, padding=(8, 4))
+            style.map("TButton", background=[("active", "#505050")])
+            style.configure("TSeparator", background="#3e3e42")
+            style.configure("TScrollbar", background="#3e3e42", troughcolor="#2d2d30")
 
-        # Treeview
-        style.configure("Treeview", font=("Consolas", 9), rowheight=28)
-        style.configure("Treeview.Heading", font=("Segoe UI", 9, "bold"))
+            style.configure("Title.TLabel", font=("Segoe UI", 14, "bold"),
+                           background="#1e1e1e", foreground="#ffffff")
+            style.configure("Subtitle.TLabel", font=("Segoe UI", 9),
+                           background="#1e1e1e", foreground="#a0a0a0")
+            style.configure("Status.TLabel", font=("Segoe UI", 8),
+                           background="#1e1e1e", foreground="#808080")
+            style.configure("Preset.TButton", font=("Segoe UI", 9), padding=(8, 4))
+
+            # Treeview dark
+            style.configure("Treeview", font=("Consolas", 9), rowheight=28,
+                           background="#252526", foreground="#cccccc",
+                           fieldbackground="#252526")
+            style.configure("Treeview.Heading", font=("Segoe UI", 9, "bold"),
+                           background="#2d2d30", foreground="#d4d4d4")
+            style.map("Treeview",
+                     background=[("selected", "#094771")],
+                     foreground=[("selected", "#ffffff")])
+        else:
+            style.configure("Title.TLabel", font=("Segoe UI", 14, "bold"))
+            style.configure("Subtitle.TLabel", font=("Segoe UI", 9))
+            style.configure("Status.TLabel", font=("Segoe UI", 8))
+            style.configure("Preset.TButton", font=("Segoe UI", 9), padding=(8, 4))
+            style.configure("Treeview", font=("Consolas", 9), rowheight=28)
+            style.configure("Treeview.Heading", font=("Segoe UI", 9, "bold"))
+
+    def _preset_colors(self, state):
+        """Return (bg, fg, border, label) for a preset card state, respecting dark mode."""
+        if self.is_dark:
+            schemes = {
+                'available': ('#1a3a2a', '#8fd19e', '#28a745', '已内置 · 点击封禁'),
+                'no_data':   ('#2d2d30', '#8e8e93', '#3e3e42', '需提供安装包或下载证书数据'),
+                'blocked':   ('#1a2a4a', '#8fbcff', '#007bff', '已封禁 ✓'),
+            }
+        else:
+            schemes = {
+                'available': ('#d4edda', '#155724', '#28a745', '已内置 · 点击封禁'),
+                'no_data':   ('#e9ecef', '#6c757d', '#ced4da', '需提供安装包或下载证书数据'),
+                'blocked':   ('#cce5ff', '#004085', '#007bff', '已封禁 ✓'),
+            }
+        bg, fg, border, label = schemes[state]
+        return {'bg': bg, 'fg': fg, 'border': border, 'label': label}
 
     def build_ui(self):
         # --- Title bar ---
@@ -722,12 +892,24 @@ class CertLockApp:
         )
         self.btn_refresh.pack(side=tk.LEFT)
 
-        # Export button
+        # Right-side buttons
         self.btn_export = ttk.Button(
             btn_frame, text="📋 导出证书",
             command=self.on_export, width=14
         )
-        self.btn_export.pack(side=tk.RIGHT)
+        self.btn_export.pack(side=tk.RIGHT, padx=(6, 0))
+
+        self.btn_restore = ttk.Button(
+            btn_frame, text="📥 还原策略",
+            command=self.on_restore, width=14
+        )
+        self.btn_restore.pack(side=tk.RIGHT, padx=(0, 0))
+
+        self.btn_backup = ttk.Button(
+            btn_frame, text="📤 备份策略",
+            command=self.on_backup, width=14
+        )
+        self.btn_backup.pack(side=tk.RIGHT, padx=(0, 6))
 
         # Separator
         ttk.Separator(main_frame, orient=tk.HORIZONTAL).pack(fill=tk.X)
@@ -748,13 +930,6 @@ class CertLockApp:
         preset_frame = ttk.Frame(main_frame)
         preset_frame.pack(fill=tk.X, pady=(2, 8))
 
-        # Color schemes
-        self.PRESET_COLORS = {
-            'available': {'bg': '#d4edda', 'fg': '#155724', 'border': '#28a745', 'label': '已内置 · 点击封禁'},
-            'no_data':   {'bg': '#e9ecef', 'fg': '#6c757d', 'border': '#ced4da', 'label': '需提供安装包'},
-            'blocked':   {'bg': '#cce5ff', 'fg': '#004085', 'border': '#007bff', 'label': '已封禁 ✓'},
-        }
-
         self.preset_cards = {}  # label -> widget dict for live color updates
         row_frame = ttk.Frame(preset_frame)
         row_frame.pack(fill=tk.X, pady=1)
@@ -769,7 +944,7 @@ class CertLockApp:
             # Determine actual state (not just metadata flag)
             has_cert_data = self._preset_has_cert_data(preset)
             state = 'available' if has_cert_data else 'no_data'
-            colors = self.PRESET_COLORS[state]
+            colors = self._preset_colors(state)
 
             # Card frame
             card = tk.Frame(
@@ -806,19 +981,42 @@ class CertLockApp:
 
             col_count += 1
 
+        # --- Cert data missing banner (hidden unless source run w/o certs/) ---
+        if self.is_dark:
+            cd_bg, cd_fg, cd_border = '#1a2a4a', '#8fbcff', '#007bff'
+        else:
+            cd_bg, cd_fg, cd_border = '#cce5ff', '#004085', '#007bff'
+        self.certdata_banner = tk.Frame(
+            self.root, bg=cd_bg, highlightbackground=cd_border,
+            highlightthickness=1, padx=8, pady=4
+        )
+        tk.Label(
+            self.certdata_banner, text="📦 证书数据文件未找到",
+            bg=cd_bg, fg=cd_fg, font=("Segoe UI", 9, "bold")
+        ).pack(side=tk.LEFT)
+        tk.Label(
+            self.certdata_banner,
+            text="从 GitHub Releases 下载 certs/ 文件夹，或直接提供厂商安装包提取",
+            bg=cd_bg, fg=cd_fg, font=("Segoe UI", 9)
+        ).pack(side=tk.LEFT, padx=(8, 0))
+
         # --- Restart warning banner (hidden until certs are blocked) ---
+        if self.is_dark:
+            rb_bg, rb_fg, rb_border = '#3d3200', '#ffc107', '#856404'
+        else:
+            rb_bg, rb_fg, rb_border = '#fff3cd', '#856404', '#ffc107'
         self.restart_banner = tk.Frame(
-            self.root, bg="#fff3cd", highlightbackground="#ffc107",
+            self.root, bg=rb_bg, highlightbackground=rb_border,
             highlightthickness=1, padx=8, pady=4
         )
         tk.Label(
             self.restart_banner, text="⚠️ 证书封禁需重启计算机后生效",
-            bg="#fff3cd", fg="#856404", font=("Segoe UI", 9, "bold")
+            bg=rb_bg, fg=rb_fg, font=("Segoe UI", 9, "bold")
         ).pack(side=tk.LEFT)
         tk.Label(
             self.restart_banner,
             text="已封禁的软件在重启前仍可运行",
-            bg="#fff3cd", fg="#856404", font=("Segoe UI", 9)
+            bg=rb_bg, fg=rb_fg, font=("Segoe UI", 9)
         ).pack(side=tk.LEFT, padx=(8, 0))
 
         # --- Status bar ---
@@ -830,13 +1028,15 @@ class CertLockApp:
 
         self.status_label = ttk.Label(
             status_frame, text="就绪",
-            style="Status.TLabel", foreground="gray"
+            style="Status.TLabel",
+            foreground="#808080" if self.is_dark else "gray"
         )
         self.status_label.pack(side=tk.LEFT)
 
         self.policy_label = ttk.Label(
             status_frame, text="",
-            style="Status.TLabel", foreground="gray"
+            style="Status.TLabel",
+            foreground="#808080" if self.is_dark else "gray"
         )
         self.policy_label.pack(side=tk.RIGHT)
 
@@ -958,7 +1158,7 @@ class CertLockApp:
                 state = 'available'
             else:
                 state = 'no_data'
-            colors = self.PRESET_COLORS[state]
+            colors = self._preset_colors(state)
             widgets['card'].configure(bg=colors['bg'], highlightbackground=colors['border'])
             widgets['name'].configure(bg=colors['bg'], fg=colors['fg'])
             widgets['hint'].configure(bg=colors['bg'], fg=colors['fg'], text=colors['label'])
@@ -994,9 +1194,15 @@ class CertLockApp:
 
         # Update policy status
         if reg_is_policy_active():
-            self.policy_label.config(text="策略: 已启用", foreground="green")
+            self.policy_label.config(
+                text="策略: 已启用",
+                foreground="#4ec94e" if self.is_dark else "green"
+            )
         else:
-            self.policy_label.config(text="策略: 未配置", foreground="red")
+            self.policy_label.config(
+                text="策略: 未配置",
+                foreground="#f44747" if self.is_dark else "red"
+            )
 
         # Show/hide restart warning banner
         if certs:
@@ -1006,6 +1212,16 @@ class CertLockApp:
             )
         else:
             self.restart_banner.pack_forget()
+
+        # Show/hide cert data missing banner (source run without certs/ folder)
+        is_frozen = getattr(sys, 'frozen', False)
+        if not is_frozen and not PRESET_CERT_DATA:
+            self.certdata_banner.pack(
+                fill=tk.X, side=tk.BOTTOM,
+                before=self._status_separator
+            )
+        else:
+            self.certdata_banner.pack_forget()
 
         # Update preset button states
         self._update_preset_states()
@@ -1030,6 +1246,62 @@ class CertLockApp:
         # Refresh card colors
         self._refresh_preset_cards()
 
+    def _show_extraction_error(self, error_info, filepath):
+        """Show a user-friendly error dialog for certificate extraction failures."""
+        err_type = error_info.get('error', 'unknown')
+        err_msg  = error_info.get('error_msg', '')
+        fname    = os.path.basename(filepath)
+
+        messages = {
+            'no_signature': (
+                "无数字签名",
+                f"文件 \"{fname}\" 没有数字签名。\n\n"
+                "证书封禁需要目标软件具有数字签名。\n"
+                "请选择该厂商其他有签名的 .exe 文件。\n\n"
+                "替代方案：使用哈希规则或路径规则封禁。"
+            ),
+            'not_pe': (
+                "不是有效的可执行文件",
+                f"文件 \"{fname}\" 不是有效的 PE 文件（.exe/.dll）。\n\n"
+                "请确认选择了正确的已签名可执行文件。\n"
+                "提示：安装包 (.exe) 通常有签名，\n"
+                "解压后的 .dll 也可能有签名。"
+            ),
+            'unsupported': (
+                "签名格式不支持",
+                f"文件 \"{fname}\" 的签名格式不受支持。\n\n"
+                "详细信息: {err_msg}\n\n"
+                "请尝试该厂商的其他签名文件。\n"
+                "或提 Issue 附上文件信息供我们适配。"
+            ).format(err_msg=err_msg),
+            'file_corrupt': (
+                "文件损坏",
+                f"文件 \"{fname}\" 可能已损坏或截断。\n\n"
+                "详细信息: {err_msg}\n\n"
+                "请重新下载该文件后重试。"
+            ).format(err_msg=err_msg),
+            'parse_error': (
+                "证书解析失败",
+                f"提取证书时发生解析错误。\n\n"
+                "详细信息: {err_msg}\n\n"
+                "可能原因：\n"
+                "  · 签名数据不完整\n"
+                "  · 使用了非标准签名格式\n"
+                "  · 文件被加壳/混淆\n\n"
+                "请尝试该厂商的其他签名文件。"
+            ).format(err_msg=err_msg),
+            'unknown': (
+                "提取失败",
+                f"提取证书时发生未知错误。\n\n"
+                "详细信息: {err_msg}\n\n"
+                "请重试或提 Issue 反馈。"
+            ).format(err_msg=err_msg),
+        }
+
+        title, msg = messages.get(err_type, messages['unknown'])
+        messagebox.showerror(title, msg)
+        self.status_label.config(text=f"提取失败 — {title}")
+
     def on_block_new(self):
         """Block a new certificate from a signed .exe."""
         filepath = filedialog.askopenfilename(
@@ -1046,15 +1318,8 @@ class CertLockApp:
         self.root.update()
 
         info = extract_cert_from_exe(filepath)
-        if info is None:
-            messagebox.showerror(
-                "无数字签名",
-                "该文件没有有效的数字签名！\n\n"
-                "证书封禁需要目标软件具有数字签名。\n"
-                "请选择该厂商其他有签名的 .exe 文件。\n\n"
-                "替代方案：使用哈希规则或路径规则封禁。"
-            )
-            self.status_label.config(text="提取失败 — 文件无数字签名")
+        if 'error' in info:
+            self._show_extraction_error(info, filepath)
             return
 
         thumbprint = info.get('THUMBPRINT', '')
@@ -1180,6 +1445,87 @@ class CertLockApp:
         except Exception as e:
             messagebox.showerror("导出失败", str(e))
 
+    def on_backup(self):
+        """Export all SRP rules to a JSON backup file."""
+        from datetime import datetime
+
+        rules = reg_export_all_rules()
+        if not rules.get('certificates'):
+            messagebox.showinfo("无需备份", "当前没有已封禁的证书规则。")
+            return
+
+        rules['exported_at'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+        filename = filedialog.asksaveasfilename(
+            title="备份策略到...",
+            defaultextension=".json",
+            filetypes=[("JSON 文件", "*.json"), ("所有文件", "*.*")],
+            initialfile=f"CertLock_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+        )
+        if not filename:
+            return
+
+        try:
+            import json
+            with open(filename, "w", encoding="utf-8") as f:
+                json.dump(rules, f, indent=2, ensure_ascii=False)
+            messagebox.showinfo(
+                "备份成功",
+                f"已导出 {len(rules['certificates'])} 条证书规则到:\n{filename}"
+            )
+            self.status_label.config(text=f"策略已备份 → {os.path.basename(filename)}")
+        except Exception as e:
+            messagebox.showerror("备份失败", str(e))
+
+    def on_restore(self):
+        """Import SRP rules from a JSON backup file."""
+        filepath = filedialog.askopenfilename(
+            title="选择策略备份文件",
+            filetypes=[("JSON 文件", "*.json"), ("所有文件", "*.*")]
+        )
+        if not filepath:
+            return
+
+        try:
+            import json
+            with open(filepath, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception as e:
+            messagebox.showerror("读取失败", f"无法读取备份文件:\n{str(e)}")
+            return
+
+        certs = data.get('certificates', [])
+        if not certs:
+            messagebox.showinfo("空备份", "备份文件中没有证书规则。")
+            return
+
+        exported_at = data.get('exported_at', '未知时间')
+        existing = reg_list_certs()
+        existing_thumbs = {c['thumbprint'].upper() for c in existing}
+        new_certs = [c for c in certs if c.get('thumbprint', '').upper() not in existing_thumbs]
+
+        confirm = messagebox.askyesno(
+            "确认还原",
+            f"备份文件信息:\n"
+            f"  导出时间: {exported_at}\n"
+            f"  来源版本: {data.get('version', '未知')}\n"
+            f"  证书规则: {len(certs)} 条\n"
+            f"  其中新增: {len(new_certs)} 条\n\n"
+            f"将写入 {len(new_certs)} 条新规则。\n"
+            f"⚠ 需要重启计算机才能生效。\n\n"
+            f"确定还原？"
+        )
+        if not confirm:
+            return
+
+        success, skipped, errors = reg_import_rules(data)
+        msg = f"还原完成:\n  成功写入: {success} 条\n  已存在跳过: {skipped} 条"
+        if errors:
+            msg += f"\n  失败: {errors} 条"
+        messagebox.showinfo("还原结果", msg)
+        self.status_label.config(text=f"策略还原完成 — 写入 {success} 条")
+        self.refresh_list()
+
     def on_preset_click(self, label, preset):
         """Handle preset button click."""
         # Support both single thumbprint and multiple thumbprints per preset
@@ -1293,13 +1639,8 @@ class CertLockApp:
         self.root.update()
 
         info = extract_cert_from_exe(filepath)
-        if info is None:
-            messagebox.showerror(
-                "无数字签名",
-                "该文件没有有效的数字签名！\n"
-                "请尝试该厂商的其他 .exe 文件。"
-            )
-            self.status_label.config(text="提取失败")
+        if 'error' in info:
+            self._show_extraction_error(info, filepath)
             return
 
         thumbprint = info.get('THUMBPRINT', '')

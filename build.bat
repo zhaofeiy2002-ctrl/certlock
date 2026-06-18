@@ -25,19 +25,7 @@ if exist build rmdir /s /q build
 if exist dist rmdir /s /q dist
 
 echo [2/2] Building single executable...
-python -m PyInstaller ^
-    --onefile ^
-    --windowed ^
-    --name CertLock ^
-    --clean ^
-    --noconfirm ^
-    --add-data "cert_360_b64.txt;." ^
-    --add-data "cert_ludashi_b64.txt;." ^
-    --add-data "cert_tencent_b64.txt;." ^
-    --add-data "cert_kingsoft_b64.txt;." ^
-    --add-data "cert_kingsoft_dg_b64.txt;." ^
-    --add-data "cert_2345_b64.txt;." ^
-    certlock.py
+python -m PyInstaller certlock.spec --clean --noconfirm
 
 if %errorlevel% neq 0 (
     echo [ERROR] Build failed!
