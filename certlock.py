@@ -600,8 +600,8 @@ class CertLockApp:
     def __init__(self, root):
         self.root = root
         self.root.title(f"{APP_NAME} v{APP_VERSION}")
-        self.root.geometry("720x520")
-        self.root.minsize(600, 400)
+        self.root.geometry("780x620")
+        self.root.minsize(640, 500)
         self.root.resizable(True, True)
 
         # Set icon (optional)
@@ -683,7 +683,7 @@ class CertLockApp:
         columns = ("thumbprint", "description", "status")
         self.tree = ttk.Treeview(
             tree_frame, columns=columns, show="headings",
-            selectmode="browse", height=10
+            selectmode="browse", height=8
         )
         self.tree.heading("thumbprint", text="证书指纹 (Thumbprint)")
         self.tree.heading("description", text="描述")
