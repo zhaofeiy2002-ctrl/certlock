@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
 """
-CertLock v1.5.0 — Windows Certificate/Hash Blocker
+CertLock v1.6.0 — Windows Certificate/Hash Blocker
 =============================================
 A lightweight GUI tool to block unwanted software via Windows
-Software Restriction Policy (SRP) certificate rules.
+Software Restriction Policy (SRP) certificate & hash rules.
 
 Features: cert/hash blocking, 6 presets, dark mode, CLI mode,
           restart banner, impact preview, policy backup/restore,
-          operation history, community template import/export.
+          operation history, community template import/export,
+          system path protection, certificate expiry warnings,
+          Windows Event Log, policy conflict detection,
+          --json/--csv output, --dry-run mode, export sanitization.
 
 Style: Single-window, portable, no-install, ZyperWin++ aesthetic.
 Requires: Python 3.6+ (tkinter built-in), Windows 10/11
@@ -35,10 +38,33 @@ from tkinter import ttk, messagebox, filedialog
 # Constants
 # ============================================================
 APP_NAME    = "CertLock"
-APP_VERSION = "1.5.0"
+APP_VERSION = "1.6.0"
 SRP_ROOT    = r"SOFTWARE\Policies\Microsoft\Windows\Safer\CodeIdentifiers"
 CERT_RULES  = SRP_ROOT + "\\0\\Certificates"
 HASH_RULES  = SRP_ROOT + "\\0\\Hashes"
+
+# System directories protected from hash blocking
+SYSTEM_PATHS = [
+    r"C:\Windows",
+    r"C:\Windows\System32",
+    r"C:\Windows\SysWOW64",
+    r"C:\Windows\System",
+    r"C:\Windows\Boot",
+    r"C:\Windows\SystemResources",
+    r"C:\Program Files",
+    r"C:\Program Files (x86)",
+]
+
+# Standardized exit codes for CLI mode
+EXIT_SUCCESS         = 0   # Operation completed successfully
+EXIT_NEED_ADMIN      = 1   # Administrator privileges required
+EXIT_FILE_NOT_FOUND  = 2   # Specified file does not exist
+EXIT_INVALID_CERT    = 3   # Certificate extraction/validation failed
+EXIT_OPERATION_FAILED = 4  # Registry write or policy refresh failed
+EXIT_CONFLICT        = 5   # Policy conflict detected
+
+# Batch import threshold
+BATCH_WARN_THRESHOLD = 20
 
 # Built-in certificate presets
 # Format: { "label": { "thumbprint", "vendor", "products", "cert_data"(optional) } }
@@ -105,6 +131,117 @@ def elevate():
         f'"{os.path.abspath(__file__)}"', None, 1
     )
     return False
+
+
+# ============================================================
+# Safety & Audit Helpers
+# ============================================================
+def is_system_path(filepath):
+    """Check if a file is under a protected system directory.
+    Returns (is_system: bool, matched_path: str)."""
+    norm = os.path.normpath(os.path.abspath(filepath)).lower()
+    for sp in SYSTEM_PATHS:
+        sp_norm = os.path.normpath(sp).lower()
+        if norm == sp_norm or norm.startswith(sp_norm + os.sep):
+            return True, sp
+    return False, ""
+
+
+def write_event_log(message, event_id=1001, level="WARNING"):
+    """Write an event to the Windows Application event log.
+    Best-effort: silently ignores failures (e.g., no admin)."""
+    try:
+        subprocess.run([
+            "eventcreate", "/L", "APPLICATION", "/T", level,
+            "/ID", str(event_id), "/SO", APP_NAME, "/D", message
+        ], capture_output=True, timeout=10)
+    except Exception:
+        pass  # Event log is advisory, never block on failure
+
+
+def _check_cert_expiry(b64_data):
+    """Check if a BASE64-encoded DER certificate has expired.
+    Returns (expired: bool, not_after_display: str)."""
+    try:
+        der = base64.b64decode(b64_data)
+        _, _, _, _, not_after = _parse_x509_subject_and_issuer(der)
+        if not not_after:
+            return False, ""
+        # Parse UTCTime (YYMMDDHHMMSSZ) or GeneralizedTime (YYYYMMDDHHMMSSZ)
+        ts = not_after.rstrip("Z")
+        if len(ts) == 12:  # UTCTime
+            year = int(ts[0:2])
+            year = 2000 + year if year < 50 else 1900 + year
+            month, day = int(ts[2:4]), int(ts[4:6])
+        elif len(ts) >= 14:  # GeneralizedTime
+            year, month, day = int(ts[0:4]), int(ts[4:6]), int(ts[6:8])
+        else:
+            return False, not_after
+        from datetime import date
+        expiry_date = date(year, month, day)
+        return date.today() > expiry_date, f"{year}-{month:02d}-{day:02d}"
+    except Exception:
+        return False, ""
+
+
+def check_policy_conflicts():
+    """Scan SRP for rules not created by CertLock.
+    Returns a list of conflict descriptions (empty = no conflict)."""
+    conflicts = []
+    try:
+        srp = winreg.OpenKey(
+            winreg.HKEY_LOCAL_MACHINE, SRP_ROOT, 0,
+            winreg.KEY_READ | winreg.KEY_WOW64_64KEY
+        )
+        # Check for unexpected top-level values
+        expected_values = {"DefaultLevel", "PolicyScope", "authenticodeenabled"}
+        idx = 0
+        while True:
+            try:
+                name, val, _ = winreg.EnumValue(srp, idx)
+                if name not in expected_values:
+                    conflicts.append(f"非预期策略值: {name}")
+                idx += 1
+            except OSError:
+                break
+        # Check for unexpected subkeys beyond \0
+        expected_keys = {"0"}
+        idx = 0
+        while True:
+            try:
+                key_name = winreg.EnumKey(srp, idx)
+                if key_name not in expected_keys:
+                    conflicts.append(f"非预期策略路径: \\{key_name}")
+                idx += 1
+            except OSError:
+                break
+        winreg.CloseKey(srp)
+        # Check for non-CertLock subpaths under \0
+        try:
+            path0 = winreg.OpenKey(
+                winreg.HKEY_LOCAL_MACHINE, SRP_ROOT + "\\0", 0,
+                winreg.KEY_READ | winreg.KEY_WOW64_64KEY
+            )
+            expected_sub = {"Certificates", "Hashes"}
+            idx = 0
+            while True:
+                try:
+                    sub_name = winreg.EnumKey(path0, idx)
+                    if sub_name not in expected_sub:
+                        conflicts.append(
+                            f"非预期规则类型: \\0\\{sub_name}"
+                        )
+                    idx += 1
+                except OSError:
+                    break
+            winreg.CloseKey(path0)
+        except FileNotFoundError:
+            pass
+    except FileNotFoundError:
+        pass  # No SRP configured yet
+    except Exception:
+        pass
+    return conflicts
 
 
 # ============================================================
@@ -501,11 +638,13 @@ def reg_remove_hash(sha256):
 # ============================================================
 def export_community_template(filepath, selected_entries):
     """Export selected cert/hash rules as a community template JSON.
-    selected_entries: list of {type:'cert'|'hash', thumbprint/hash, description, cert_data/hash_data}"""
+    selected_entries: list of {type:'cert'|'hash', thumbprint/hash, description, cert_data/hash_data}
+
+    Sanitization: strips local paths, usernames, and other PII from export."""
     template = {
         'format_version': '1.0',
         'source': 'CertLock',
-        'exported_by': os.environ.get('USERNAME', 'anonymous'),
+        'exported_by': 'anonymous',  # Sanitized: no local username
         'exported_at': '',  # filled by caller
         'vendor_info': {
             'name': '',
@@ -518,7 +657,7 @@ def export_community_template(filepath, selected_entries):
     for entry in selected_entries:
         rule = {
             'type': entry.get('type', 'cert'),
-            'description': entry.get('description', ''),
+            'description': _sanitize_export_desc(entry.get('description', '')),
             'disallowed': True,
         }
         if rule['type'] == 'cert':
@@ -531,6 +670,17 @@ def export_community_template(filepath, selected_entries):
     with open(filepath, 'w', encoding='utf-8') as f:
         json.dump(template, f, indent=2, ensure_ascii=False)
     return len(template['rules'])
+
+
+def _sanitize_export_desc(desc):
+    """Remove local filesystem paths and PII from rule descriptions for export."""
+    import re
+    # Strip Windows paths (C:\..., \\...\)
+    desc = re.sub(r'[A-Za-z]:\\[^\s,;]*', '[PATH]', desc)
+    desc = re.sub(r'\\\\[^\s,;]*', '[UNC_PATH]', desc)
+    # Strip recognizable usernames (keep generic "Block" prefix)
+    desc = re.sub(r'Block\s+\S+\\[^\s,;]*', 'Block [FILE]', desc)
+    return desc
 
 
 def import_community_template(filepath):
@@ -946,7 +1096,7 @@ def get_app_dir():
 # GUI Application
 # ============================================================
 class CertLockApp:
-    def __init__(self, root):
+    def __init__(self, root, policy_conflicts=None):
         self.root = root
         self.root.title(f"{APP_NAME} v{APP_VERSION}")
         self.root.geometry("780x620")
@@ -961,6 +1111,9 @@ class CertLockApp:
 
         # View toggle: cert or hash rules
         self.show_hashes = False
+
+        # Policy conflicts detected at startup
+        self.policy_conflicts = policy_conflicts or []
 
         # Set icon (optional)
         try:
@@ -980,6 +1133,10 @@ class CertLockApp:
 
         # Load data
         self.refresh_list()
+
+        # Show policy conflict warning if applicable
+        if self.policy_conflicts:
+            self._show_conflict_warning()
 
         # Center window
         self.root.update_idletasks()
@@ -1345,6 +1502,25 @@ class CertLockApp:
         self.policy_label.pack(side=tk.RIGHT)
 
     # ============================================================
+    # Policy conflict warning
+    # ============================================================
+    def _show_conflict_warning(self):
+        """Show a non-blocking warning about detected policy conflicts."""
+        if not self.policy_conflicts:
+            return
+        detail = "\n".join(f"  · {c}" for c in self.policy_conflicts[:5])
+        if len(self.policy_conflicts) > 5:
+            detail += f"\n  ... 及另外 {len(self.policy_conflicts) - 5} 项"
+        messagebox.showwarning(
+            "策略冲突检测",
+            f"检测到系统中存在非 CertLock 创建的 SRP 策略规则：\n\n"
+            f"{detail}\n\n"
+            f"这些规则可能与 CertLock 的操作产生冲突。\n"
+            f"CertLock 仅管理 \\0\\Certificates 和 \\0\\Hashes 路径。\n\n"
+            f"如不确定，请通过「备份策略」先导出当前全部规则。"
+        )
+
+    # ============================================================
     # Preset helpers
     # ============================================================
     def _preset_has_cert_data(self, preset):
@@ -1603,6 +1779,10 @@ class CertLockApp:
             )
             self.status_label.config(text=f"已封禁: {o} | 重启后生效")
             self._add_history("cert_block", thumbprint, o if o else cn)
+            write_event_log(
+                f"Blocked certificate: {o} ({thumbprint[:16]}...)",
+                1001, "WARNING"
+            )
         else:
             messagebox.showerror(
                 "封禁失败",
@@ -1916,6 +2096,20 @@ class CertLockApp:
         if not filepath:
             return
 
+        # System directory protection
+        is_sys, sys_path = is_system_path(filepath)
+        if is_sys:
+            messagebox.showerror(
+                "禁止操作 — 系统目录保护",
+                f"拒绝封禁系统目录下的文件！\n\n"
+                f"文件: {os.path.basename(filepath)}\n"
+                f"路径: {sys_path}\n\n"
+                f"封禁系统文件可能导致操作系统无法启动。\n\n"
+                f"如需处理系统组件，请使用其他安全策略工具。"
+            )
+            self.status_label.config(text="操作已拒绝 — 受保护的系统路径")
+            return
+
         self.status_label.config(text=f"正在计算哈希: {os.path.basename(filepath)}...")
         self.root.update()
 
@@ -1927,7 +2121,7 @@ class CertLockApp:
             return
 
         fname = os.path.basename(filepath)
-        desc = f"Block {fname} (SHA256)"
+        desc = f"Block {fname} (SHA256: {sha256[:16]}...)"
 
         confirm = messagebox.askyesno(
             "确认哈希封禁",
@@ -1946,6 +2140,10 @@ class CertLockApp:
         success = reg_add_hash(filepath, desc)
         if success:
             self._add_history("hash_block", sha256, fname)
+            write_event_log(
+                f"Blocked file hash: {fname} ({sha256[:16]}...)",
+                1002, "WARNING"
+            )
             messagebox.showinfo(
                 "封禁成功",
                 f"哈希规则已写入！\n\n"
@@ -2071,19 +2269,35 @@ class CertLockApp:
 
         cert_count = sum(1 for r in rules if r.get('type', 'cert') == 'cert')
         hash_count = sum(1 for r in rules if r.get('type') == 'hash')
+        total_rules = len(rules)
 
-        confirm = messagebox.askyesno(
-            "确认导入",
-            f"模板信息:\n"
-            f"  格式版本: {fmt_ver}\n"
-            f"  来源厂商: {vendor_name}\n"
-            f"  证书规则: {cert_count} 条\n"
-            f"  哈希规则: {hash_count} 条\n"
-            f"  导出者: {data.get('exported_by', '未知')}\n\n"
-            f"将导入 {len(rules)} 条规则。\n"
-            f"⚠ 需要重启计算机才能完全生效。\n\n"
-            f"确定导入？"
-        )
+        # Batch confirmation for large imports
+        if total_rules >= BATCH_WARN_THRESHOLD:
+            confirm = messagebox.askyesno(
+                "批量导入确认",
+                f"⚠ 导入规则数量较多（{total_rules} 条），请仔细确认：\n\n"
+                f"  格式版本: {fmt_ver}\n"
+                f"  来源厂商: {vendor_name}\n"
+                f"  证书规则: {cert_count} 条\n"
+                f"  哈希规则: {hash_count} 条\n"
+                f"  导出者: {data.get('exported_by', '未知')}\n\n"
+                f"建议先执行「备份策略」以保存当前状态。\n\n"
+                f"⚠ 需要重启计算机才能完全生效。\n\n"
+                f"确定导入？"
+            )
+        else:
+            confirm = messagebox.askyesno(
+                "确认导入",
+                f"模板信息:\n"
+                f"  格式版本: {fmt_ver}\n"
+                f"  来源厂商: {vendor_name}\n"
+                f"  证书规则: {cert_count} 条\n"
+                f"  哈希规则: {hash_count} 条\n"
+                f"  导出者: {data.get('exported_by', '未知')}\n\n"
+                f"将导入 {total_rules} 条规则。\n"
+                f"⚠ 需要重启计算机才能完全生效。\n\n"
+                f"确定导入？"
+            )
         if not confirm:
             return
 
@@ -2186,11 +2400,14 @@ class CertLockApp:
             confirm = messagebox.askyesno(
                 "撤销封禁",
                 f"将移除刚添加的证书封禁：\n"
-                f"  {rule_id[:40]}...\n\n确定撤销？"
+                f"  {rule_id[:40]}...\n\n"
+                f"⚠ 撤销同样需要重启计算机才能完全生效。\n\n"
+                f"确定撤销？"
             )
             if confirm:
                 if reg_remove_cert(rule_id):
-                    self.status_label.config(text="已撤销: 证书封禁")
+                    self.status_label.config(text="已撤销: 证书封禁 | 重启后生效")
+                    write_event_log(f"Undone cert block: {rule_id[:16]}...", 1003, "WARNING")
                     self._add_history("cert_remove", rule_id, "撤销封禁")
                 else:
                     messagebox.showerror("撤销失败", "无法移除该规则。")
@@ -2198,11 +2415,14 @@ class CertLockApp:
             confirm = messagebox.askyesno(
                 "撤销封禁",
                 f"将移除刚添加的哈希封禁：\n"
-                f"  {rule_id[:40]}...\n\n确定撤销？"
+                f"  {rule_id[:40]}...\n\n"
+                f"⚠ 撤销同样需要重启计算机才能完全生效。\n\n"
+                f"确定撤销？"
             )
             if confirm:
                 if reg_remove_hash(rule_id):
-                    self.status_label.config(text="已撤销: 哈希封禁")
+                    self.status_label.config(text="已撤销: 哈希封禁 | 重启后生效")
+                    write_event_log(f"Undone hash block: {rule_id[:16]}...", 1003, "WARNING")
                     self._add_history("hash_remove", rule_id, "撤销封禁")
                 else:
                     messagebox.showerror("撤销失败", "无法移除该规则。")
@@ -2262,13 +2482,26 @@ class CertLockApp:
             else:
                 for c in certs:
                     status_text = "已阻止" if c['disallowed'] else "已允许"
+                    # Check certificate expiry
+                    cert_data = c.get('cert_data', '')
+                    if cert_data:
+                        expired, expiry_str = _check_cert_expiry(cert_data)
+                        if expired:
+                            status_text = f"已阻止 ⚠过期({expiry_str})"
                     self.tree.insert("", tk.END, values=(
                         c['thumbprint'],
                         c['description'],
                         status_text
                     ))
+                # Count expired certs for status bar
+                expired_count = 0
+                for c in certs:
+                    cd = c.get('cert_data', '')
+                    if cd and _check_cert_expiry(cd)[0]:
+                        expired_count += 1
+                exp_note = f" | {expired_count} 张证书已过期" if expired_count else ""
                 self.status_label.config(
-                    text=f"共 {len(certs)} 个证书规则 | 重启后完全生效"
+                    text=f"共 {len(certs)} 个证书规则 | 重启后完全生效{exp_note}"
                 )
 
         # Update policy status
@@ -2340,10 +2573,12 @@ class CertLockApp:
             success = reg_remove_hash(rule_id)
             if success:
                 self._add_history("hash_remove", rule_id, description)
+                write_event_log(f"Removed hash rule: {rule_id[:16]}...", 1003, "WARNING")
         else:
             success = reg_remove_cert(rule_id)
             if success:
                 self._add_history("cert_remove", rule_id, description)
+                write_event_log(f"Removed certificate rule: {rule_id[:16]}...", 1003, "WARNING")
 
         if success:
             messagebox.showinfo("移除成功", f"{rule_type}规则已移除。重启后生效。")
@@ -2364,7 +2599,10 @@ def _parse_args():
   certlock --block "C:\\path\\app.exe"  # 提取证书并封禁
   certlock --hash "C:\\path\\app.exe"   # 按 SHA256 哈希封禁(无签名软件)
   certlock --list                       # 列出所有规则
+  certlock --list --json                # JSON 格式输出(脚本化)
+  certlock --list --csv                 # CSV 格式输出
   certlock --remove <指纹或哈希>        # 移除指定规则
+  certlock --dry-run --block app.exe    # 预览封禁影响，不实际写入
   certlock --export backup.json         # 导出全部规则
   certlock --import backup.json         # 导入规则
   certlock --template-export t.json     # 导出社区模板
@@ -2378,6 +2616,12 @@ def _parse_args():
                        help='移除指定证书指纹或 SHA256 哈希')
     parser.add_argument('--list', action='store_true',
                        help='列出所有已封禁规则')
+    parser.add_argument('--json', action='store_true',
+                       help='以 JSON 格式输出（配合 --list 使用）')
+    parser.add_argument('--csv', action='store_true',
+                       help='以 CSV 格式输出（配合 --list 使用）')
+    parser.add_argument('--dry-run', action='store_true',
+                       help='预览操作影响，不实际写入策略')
     parser.add_argument('--export', metavar='FILE',
                        help='导出全部规则为 JSON')
     parser.add_argument('--import', metavar='FILE', dest='import_file',
@@ -2391,10 +2635,28 @@ def _parse_args():
     return parser.parse_args()
 
 
-def _cli_list():
-    """CLI: list all rules."""
+def _cli_list(fmt="text"):
+    """CLI: list all rules. fmt: text, json, csv."""
     certs = reg_list_certs()
     hashes = reg_list_hashes()
+
+    if fmt == "json":
+        output = {"certificates": certs, "hashes": hashes, "count": len(certs) + len(hashes)}
+        print(json.dumps(output, indent=2, ensure_ascii=False))
+        return
+    if fmt == "csv":
+        print("type,id,description,status")
+        for c in certs:
+            status = "blocked" if c['disallowed'] else "allowed"
+            desc = c['description'].replace('"', '""')
+            print(f'cert,{c["thumbprint"]},"{desc}",{status}')
+        for h in hashes:
+            status = "blocked" if h['disallowed'] else "allowed"
+            desc = h['description'].replace('"', '""')
+            print(f'hash,{h["hash"]},"{desc}",{status}')
+        return
+
+    # Plain text
     if not certs and not hashes:
         print("当前没有任何封禁规则。")
         return
@@ -2421,49 +2683,112 @@ def _cli_remove(rule_id):
         if c['thumbprint'].upper() == rule_id:
             if reg_remove_cert(c['thumbprint']):
                 print(f"已移除证书规则: {c['description']}")
+                write_event_log(f"Removed certificate rule: {c['thumbprint'][:16]}...", 1003, "WARNING")
+                sys.exit(EXIT_SUCCESS)
             else:
                 print("移除失败（请以管理员身份运行）")
-            return
+                sys.exit(EXIT_OPERATION_FAILED)
     # Try hash
     hashes = reg_list_hashes()
     for h in hashes:
         if h['hash'].upper() == rule_id:
             if reg_remove_hash(h['hash']):
                 print(f"已移除哈希规则: {h['description']}")
+                write_event_log(f"Removed hash rule: {h['hash'][:16]}...", 1003, "WARNING")
+                sys.exit(EXIT_SUCCESS)
             else:
                 print("移除失败（请以管理员身份运行）")
-            return
+                sys.exit(EXIT_OPERATION_FAILED)
     print(f"未找到规则: {rule_id}")
+    sys.exit(EXIT_FILE_NOT_FOUND)
 
 
-def _cli_block(filepath):
+def _cli_block(filepath, dry_run=False):
     """CLI: block by cert extraction."""
+    if not os.path.isfile(filepath):
+        print(f"错误: 文件不存在 — {filepath}")
+        sys.exit(EXIT_FILE_NOT_FOUND)
+
     info = extract_cert_from_exe(filepath)
     if 'error' in info:
         print(f"错误: {info.get('error_msg', info['error'])}")
-        return
+        sys.exit(EXIT_INVALID_CERT)
+
     thumbprint = info.get('THUMBPRINT', '')
     o = info.get('O', '')
-    desc = f"Block all software signed by {o}"
+    cn = info.get('CN', '')
+    issuer = info.get('ISSUER', '')
+    not_after = info.get('NOTAFTER', '')
+    desc = f"Block all software signed by {o if o else cn}"
+
+    # Check cert expiry
+    expired, expiry_str = _check_cert_expiry(info.get('cert_blob', ''))
+    expiry_note = f"\n⚠ 证书已过期 ({expiry_str})，封禁仍有效但新版软件可能使用新证书。" if expired else ""
+
+    if dry_run:
+        print(f"[DRY-RUN] 将封禁:")
+        print(f"  厂商: {o if o else cn}")
+        print(f"  颁发者: {issuer}")
+        print(f"  指纹: {thumbprint}")
+        if expired:
+            print(f"  ⚠ 证书已过期: {expiry_str}")
+        print(f"\n实际封禁请去掉 --dry-run 参数。")
+        return
+
     if reg_add_cert(thumbprint, info.get('cert_blob', ''), desc):
-        print(f"已封禁: {o}")
+        print(f"已封禁: {o if o else cn}")
         print(f"指纹: {thumbprint}")
         print("⚠ 需要重启计算机才能完全生效。")
+        write_event_log(
+            f"Blocked certificate: {o if o else cn} ({thumbprint[:16]}...)",
+            1001, "WARNING"
+        )
     else:
         print("封禁失败（请以管理员身份运行）")
+        sys.exit(EXIT_OPERATION_FAILED)
 
 
-def _cli_hash_block(filepath):
+def _cli_hash_block(filepath, dry_run=False):
     """CLI: block by SHA256 hash."""
+    if not os.path.isfile(filepath):
+        print(f"错误: 文件不存在 — {filepath}")
+        sys.exit(EXIT_FILE_NOT_FOUND)
+
+    # System directory protection
+    is_sys, sys_path = is_system_path(filepath)
+    if is_sys:
+        print(f"错误: 拒绝封禁系统目录下的文件！\n"
+              f"  文件: {filepath}\n"
+              f"  位于受保护路径: {sys_path}\n\n"
+              f"封禁系统文件可能导致操作系统无法启动。")
+        sys.exit(EXIT_OPERATION_FAILED)
+
     sha256 = _compute_sha256(filepath)
     fname = os.path.basename(filepath)
     desc = f"Block {fname} (SHA256: {sha256[:16]}...)"
+
+    if dry_run:
+        print(f"[DRY-RUN] 将按哈希封禁:")
+        print(f"  文件: {fname}")
+        print(f"  路径: {filepath}")
+        print(f"  SHA256: {sha256}")
+        existing = reg_list_hashes()
+        if any(h['hash'].upper() == sha256 for h in existing):
+            print(f"  ⚠ 该哈希已存在于封禁列表中")
+        print(f"\n实际封禁请去掉 --dry-run 参数。")
+        return
+
     if reg_add_hash(filepath, desc):
         print(f"已封禁(哈希): {fname}")
         print(f"SHA256: {sha256}")
         print("⚠ 需要重启计算机才能完全生效。")
+        write_event_log(
+            f"Blocked file hash: {fname} ({sha256[:16]}...)",
+            1002, "WARNING"
+        )
     else:
         print("封禁失败（请以管理员身份运行）")
+        sys.exit(EXIT_OPERATION_FAILED)
 
 
 def _cli_export(filepath):
@@ -2544,8 +2869,15 @@ def _run_cli(args):
     """Execute CLI commands based on parsed args."""
     has_action = False
 
+    # Resolve output format for --list
+    list_fmt = "text"
+    if args.json:
+        list_fmt = "json"
+    elif args.csv:
+        list_fmt = "csv"
+
     if args.list:
-        _cli_list()
+        _cli_list(fmt=list_fmt)
         has_action = True
 
     if args.remove:
@@ -2553,11 +2885,11 @@ def _run_cli(args):
         has_action = True
 
     if args.block:
-        _cli_block(args.block)
+        _cli_block(args.block, dry_run=args.dry_run)
         has_action = True
 
     if args.hash:
-        _cli_hash_block(args.hash)
+        _cli_hash_block(args.hash, dry_run=args.dry_run)
         has_action = True
 
     if args.export:
@@ -2583,6 +2915,11 @@ def _run_cli(args):
 def main():
     # Parse args — if any action flag is set, run CLI mode
     args = _parse_args()
+
+    # --json / --csv imply --list
+    if args.json or args.csv:
+        args.list = True
+
     has_cli_action = any([
         args.list, args.remove, args.block, args.hash,
         args.export, args.import_file,
@@ -2593,7 +2930,7 @@ def main():
         # CLI mode
         if not is_admin():
             print("需要管理员权限。请右键 → 以管理员身份运行。")
-            sys.exit(1)
+            sys.exit(EXIT_NEED_ADMIN)
         load_preset_cert_data()
         _run_cli(args)
         return
@@ -2601,12 +2938,15 @@ def main():
     # GUI mode
     if not is_admin():
         elevate()
-        sys.exit(0)
+        sys.exit(EXIT_SUCCESS)
 
     load_preset_cert_data()
 
+    # Check for policy conflicts on startup
+    conflicts = check_policy_conflicts()
+
     root = tk.Tk()
-    app = CertLockApp(root)
+    app = CertLockApp(root, conflicts)
     root.mainloop()
 
 
