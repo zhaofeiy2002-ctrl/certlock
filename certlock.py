@@ -28,7 +28,7 @@ from tkinter import ttk, messagebox, filedialog
 # Constants
 # ============================================================
 APP_NAME    = "CertLock"
-APP_VERSION = "1.2.1"
+APP_VERSION = "1.2.2"
 SRP_ROOT    = r"SOFTWARE\Policies\Microsoft\Windows\Safer\CodeIdentifiers"
 CERT_RULES  = f"{SRP_ROOT}\\0\\Certificates"
 
@@ -548,12 +548,12 @@ def load_preset_cert_data():
 
     # Certificate preset files (shipped alongside the exe/py)
     _CERT_FILES = {
-        "7913DE9D7ED4EEEE790FF0680A4C802C1BC832AB": "cert_360_b64.txt",
-        "EC5BB0C4BE5D6F7CD9D863D6585CF1F3EF58FDA0": "cert_ludashi_b64.txt",
-        "0A518324A48A250A4579DC9E96539CB44725B38C": "cert_tencent_b64.txt",
-        "91F82992D80651CDACF4D96A307F8434BA5838CC": "cert_kingsoft_b64.txt",
-        "C1E3BDD81C9A773163D5B47A7F50111EE00CBF71": "cert_kingsoft_dg_b64.txt",
-        "AC3C08A55AB1F2700909A5B423DB4A35508D83B4": "cert_2345_b64.txt",
+        "7913DE9D7ED4EEEE790FF0680A4C802C1BC832AB": "certs/cert_360_b64.txt",
+        "EC5BB0C4BE5D6F7CD9D863D6585CF1F3EF58FDA0": "certs/cert_ludashi_b64.txt",
+        "0A518324A48A250A4579DC9E96539CB44725B38C": "certs/cert_tencent_b64.txt",
+        "91F82992D80651CDACF4D96A307F8434BA5838CC": "certs/cert_kingsoft_b64.txt",
+        "C1E3BDD81C9A773163D5B47A7F50111EE00CBF71": "certs/cert_kingsoft_dg_b64.txt",
+        "AC3C08A55AB1F2700909A5B423DB4A35508D83B4": "certs/cert_2345_b64.txt",
     }
 
     app_dir = get_app_dir()  # Cache — called once instead of per-cert

@@ -5,7 +5,7 @@ a = Analysis(
     ['certlock.py'],
     pathex=[],
     binaries=[],
-    datas=[('cert_360_b64.txt', '.'), ('cert_ludashi_b64.txt', '.'), ('cert_tencent_b64.txt', '.'), ('cert_kingsoft_b64.txt', '.'), ('cert_kingsoft_dg_b64.txt', '.'), ('cert_2345_b64.txt', '.')],
+    datas=[('certs', 'certs')],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},
