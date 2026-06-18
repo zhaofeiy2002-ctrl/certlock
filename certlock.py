@@ -16,8 +16,10 @@ Repo: https://github.com/zhaofeiy2002-ctrl/certlock
 import os
 import sys
 import ctypes
+import hashlib
+import base64
+import struct
 import winreg
-import tempfile
 import subprocess
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
@@ -73,8 +75,6 @@ CERT_PRESETS = {
 
 # Pre-loaded certificate data (Base64 DER)
 PRESET_CERT_DATA = {}
-# 360 certificate - loaded at runtime from embedded blob
-_360_BLOB_FILE = None  # Set at runtime
 
 
 # ============================================================
@@ -222,9 +222,7 @@ def reg_remove_cert(thumbprint):
         except FileNotFoundError:
             return False
 
-        # Delete the key (recursively via subprocess since winreg can't delete non-empty easily)
-        import _winreg
-        # Actually, SRP cert rule keys only have values, not subkeys
+        # Delete the key. SRP cert rule keys only have values, not subkeys.
         key = winreg.OpenKey(
             winreg.HKEY_LOCAL_MACHINE, CERT_RULES, 0,
             winreg.KEY_ALL_ACCESS | winreg.KEY_WOW64_64KEY
@@ -281,69 +279,267 @@ def reg_is_policy_active():
 # ============================================================
 def extract_cert_from_exe(exe_path):
     """
-    Extract digital certificate from a signed .exe.
-    Uses PowerShell Get-AuthenticodeSignature under the hood.
+    Extract digital certificate from a signed PE (.exe/.dll).
+    Pure Python implementation — no PowerShell dependency.
     Returns dict with cert info, or None on failure.
     """
-    ps_script = f'''
-$sig = Get-AuthenticodeSignature -FilePath "{exe_path}"
-if ($sig.SignerCertificate -eq $null) {{
-    Write-Host "ERROR:NoSignature"
-    exit 1
-}}
-$cert = $sig.SignerCertificate
-$cn = ""
-$o = ""
-foreach ($part in $cert.Subject.Split(',')) {{
-    $t = $part.Trim()
-    if ($t -match '^CN="?(.+?)"?$') {{ $cn = $Matches[1] }}
-    if ($t -match '^O="?(.+?)"?$')  {{ $o = $Matches[1] }}
-}}
-$blob = [System.Convert]::ToBase64String($cert.Export([System.Security.Cryptography.X509Certificates.X509ContentType]::Cert))
-Write-Host "THUMBPRINT:$($cert.Thumbprint)"
-Write-Host "CN:$cn"
-Write-Host "O:$o"
-Write-Host "ISSUER:$($cert.Issuer)"
-Write-Host "NOTBEFORE:$($cert.NotBefore)"
-Write-Host "NOTAFTER:$($cert.NotAfter)"
-Write-Host "STATUS:$($sig.Status)"
-Write-Host "BLOB_LEN:$($blob.Length)"
-Write-Host "---BLOB---"
-Write-Host $blob
-'''
-
     try:
-        result = subprocess.run(
-            ["powershell", "-ExecutionPolicy", "Bypass", "-Command", ps_script],
-            capture_output=True, text=True, timeout=30
-        )
-        output = result.stdout
+        der_bytes, subject, thumbprint, issuer, not_before, not_after = \
+            _extract_cert_from_pe(exe_path)
+        b64 = base64.b64encode(der_bytes).decode('ascii')
 
-        if "ERROR:NoSignature" in output:
-            return None
+        # Parse CN and O from subject
+        cn = ""
+        o = ""
+        for part in subject.split(', '):
+            if part.startswith('CN='):
+                cn = part[3:]
+            elif part.startswith('O='):
+                o = part[2:]
 
-        info = {}
-        blob_lines = []
-        in_blob = False
-        for line in output.strip().split('\n'):
-            line = line.strip()
-            if line.startswith('---BLOB---'):
-                in_blob = True
-                continue
-            if in_blob:
-                blob_lines.append(line)
-            elif ':' in line:
-                key, _, val = line.partition(':')
-                info[key] = val
-
-        if blob_lines:
-            info['cert_blob'] = ''.join(blob_lines)
-        else:
-            info['cert_blob'] = ''
-
-        return info
-    except Exception as e:
+        return {
+            'THUMBPRINT': thumbprint,
+            'CN': cn,
+            'O': o,
+            'ISSUER': issuer,
+            'NOTBEFORE': not_before,
+            'NOTAFTER': not_after,
+            'STATUS': 'Valid',
+            'BLOB_LEN': str(len(b64)),
+            'cert_blob': b64,
+        }
+    except Exception:
         return None
+
+
+# ============================================================
+# Pure Python PE Certificate Extractor (no PowerShell)
+# ============================================================
+
+def _read_tlv(der, offset):
+    """Read a DER TLV from offset. Returns (tag, length, value_offset, next_offset)."""
+    tag = der[offset]
+    offset += 1
+    length = der[offset]
+    offset += 1
+    if length & 0x80:
+        num_len = length & 0x7F
+        length = 0
+        for _ in range(num_len):
+            length = (length << 8) | der[offset]
+            offset += 1
+    return tag, length, offset, offset + length
+
+
+def _skip_tlv(der, offset):
+    """Skip one TLV, return next offset."""
+    _, _, _, nxt = _read_tlv(der, offset)
+    return nxt
+
+
+def _decode_oid(oid_bytes):
+    """Decode BER OID bytes to dotted string."""
+    if not oid_bytes:
+        return ''
+    parts = [str(oid_bytes[0] // 40), str(oid_bytes[0] % 40)]
+    value = 0
+    for b in oid_bytes[1:]:
+        if b & 0x80:
+            value = (value << 7) | (b & 0x7F)
+        else:
+            value = (value << 7) | b
+            parts.append(str(value))
+            value = 0
+    return '.'.join(parts)
+
+
+def _parse_dn(der, offset, end):
+    """Parse Distinguished Name to string."""
+    parts = []
+    try:
+        pos = offset
+        if pos < end and der[pos] == 0x30:
+            _, _, seq_val, seq_end = _read_tlv(der, pos)
+            pos, end = seq_val, seq_end
+
+        while pos < end:
+            if der[pos] != 0x31:
+                pos += 1
+                continue
+            _, _, set_val, set_next = _read_tlv(der, pos)
+            inner = set_val
+            while inner < set_next:
+                if der[inner] != 0x30:
+                    inner += 1
+                    continue
+                _, _, sq_val, sq_next = _read_tlv(der, inner)
+                oid_tag, oid_len, oid_val, oid_end = _read_tlv(der, sq_val)
+                val_tag, val_len, val_val, val_end = _read_tlv(der, oid_end)
+                try:
+                    value = der[val_val:val_end].decode('utf-8', errors='replace')
+                except Exception:
+                    value = "<binary>"
+                oid_str = _decode_oid(der[oid_val:oid_end])
+                oid_map = {
+                    '2.5.4.3': 'CN', '2.5.4.6': 'C', '2.5.4.7': 'L',
+                    '2.5.4.8': 'S', '2.5.4.10': 'O', '2.5.4.11': 'OU',
+                    '2.5.4.12': 'T', '2.5.4.97': 'serialNumber',
+                    '1.2.840.113549.1.9.1': 'E',
+                }
+                if oid_str in oid_map:
+                    parts.append(f"{oid_map[oid_str]}={value}")
+                inner = sq_next
+            pos = set_next
+    except Exception:
+        return "Unknown"
+    return ', '.join(parts)
+
+
+def _parse_x509_subject_and_issuer(der_bytes):
+    """Parse Subject and Issuer from X.509 cert DER.
+    Returns (subject, issuer, not_before, not_after).
+    """
+    try:
+        tag, _, cert_val, cert_end = _read_tlv(der_bytes, 0)
+        if tag != 0x30:
+            return "Unknown", "Unknown", "", ""
+        tbs_tag, _, tbs_val, tbs_end = _read_tlv(der_bytes, cert_val)
+        if tbs_tag != 0x30:
+            return "Unknown", "Unknown", "", ""
+
+        offset = tbs_val
+        # [0] version (optional)
+        if offset < tbs_end and der_bytes[offset] == 0xA0:
+            offset = _skip_tlv(der_bytes, offset)
+        # serialNumber
+        offset = _skip_tlv(der_bytes, offset)
+        # signature
+        offset = _skip_tlv(der_bytes, offset)
+        # issuer
+        issuer_val = offset
+        issuer_end = _skip_tlv(der_bytes, offset)
+        issuer = _parse_dn(der_bytes, issuer_val, issuer_end)
+        # validity
+        val_val = issuer_end
+        val_end = _skip_tlv(der_bytes, val_val)
+        # Parse UTCTime or GeneralizedTime inside validity SEQUENCE
+        try:
+            vtag, _, vseq_val, _ = _read_tlv(der_bytes, val_val)
+            not_before_off = vseq_val
+            _, _, nb_val, nb_end = _read_tlv(der_bytes, not_before_off)
+            not_before = der_bytes[nb_val:nb_end].decode('ascii', errors='replace')
+            _, _, na_val, _ = _read_tlv(der_bytes, nb_end)
+            not_after = der_bytes[na_val:na_val + (nb_end - nb_val)].decode('ascii', errors='replace')
+        except Exception:
+            not_before, not_after = "", ""
+        # subject
+        offset = val_end
+        subject_val = offset
+        subject_end = _skip_tlv(der_bytes, offset)
+        subject = _parse_dn(der_bytes, subject_val, subject_end)
+        return subject, issuer, not_before, not_after
+    except Exception:
+        return "Unknown", "Unknown", "", ""
+
+
+def _extract_signer_cert_from_pkcs7(pkcs7_der):
+    """Extract signer cert from PKCS#7 SignedData. Returns DER bytes."""
+    der = pkcs7_der
+    pos = 0
+    # ContentInfo SEQUENCE
+    tag, _, ci_val, ci_end = _read_tlv(der, pos)
+    if tag != 0x30:
+        raise ValueError("Expected SEQUENCE")
+
+    pos = ci_val
+    while pos < ci_end and der[pos] != 0xA0:
+        pos = _skip_tlv(der, pos)
+    if pos >= ci_end:
+        raise ValueError("[0] not found")
+
+    # [0] SignedData → SEQUENCE
+    _, _, sd_val, _ = _read_tlv(der, pos)
+    tag, _, seq_val, seq_end = _read_tlv(der, sd_val)
+    if tag != 0x30:
+        raise ValueError("Expected SEQUENCE")
+
+    # Collect certs from [0] certificates
+    certs = []
+    pos = seq_val
+    while pos < seq_end:
+        if der[pos] == 0xA0:
+            _, _, certs_val, certs_end = _read_tlv(der, pos)
+            p = certs_val
+            while p < certs_end:
+                ct, _, _, cnx = _read_tlv(der, p)
+                if ct == 0x30:
+                    certs.append(der[p:cnx])
+                p = cnx
+            pos = certs_end
+        else:
+            pos = _skip_tlv(der, pos)
+
+    if not certs:
+        raise ValueError("No certificates found")
+    if len(certs) == 1:
+        return certs[0]
+
+    # Filter out CA certs, pick largest end-entity cert
+    ca_kw = ['DigiCert', 'VeriSign', 'GlobalSign', 'Sectigo', 'thawte',
+             'Certum', 'Entrust', 'Go Daddy', "Let's Encrypt", 'Amazon',
+             'Symantec', 'GeoTrust', 'RapidSSL', 'Comodo', 'Microsoft']
+    non_ca = []
+    for c in certs:
+        try:
+            subj, _, _, _ = _parse_x509_subject_and_issuer(c)
+            if not any(kw.lower() in subj.lower() for kw in ca_kw):
+                non_ca.append(c)
+        except Exception:
+            non_ca.append(c)
+    return max(non_ca or certs, key=len)
+
+
+def _extract_cert_from_pe(exe_path):
+    """Extract signer certificate from PE file.
+    Returns (der_bytes, subject, thumbprint, issuer, not_before, not_after).
+    """
+    with open(exe_path, 'rb') as f:
+        data = f.read()
+
+    if len(data) < 64:
+        raise ValueError("File too small")
+
+    # DOS header → PE offset
+    pe_offset = struct.unpack_from('<I', data, 0x3C)[0]
+    if data[pe_offset:pe_offset + 4] != b'PE\x00\x00':
+        raise ValueError("Not a valid PE file")
+
+    # COFF → Optional Header → DataDirectory[4]
+    coff = pe_offset + 4
+    size_opt = struct.unpack_from('<H', data, coff + 16)[0]
+    opt = coff + 20
+    magic = struct.unpack_from('<H', data, opt)[0]
+    dd_start = opt + (96 if magic == 0x10b else 112 if magic == 0x20b else None)
+    if dd_start is None:
+        raise ValueError(f"Unknown PE magic: 0x{magic:04x}")
+
+    cert_va, cert_size = struct.unpack_from('<II', data, dd_start + 4 * 8)
+    if cert_size == 0 or cert_va == 0:
+        raise ValueError("No digital signature")
+
+    # WIN_CERTIFICATE → PKCS#7
+    win_cert = data[cert_va:cert_va + cert_size]
+    if len(win_cert) < 8:
+        raise ValueError("WIN_CERTIFICATE too small")
+    dw_len, _, w_type = struct.unpack_from('<IHH', win_cert, 0)
+    if w_type != 0x0002:
+        raise ValueError(f"Not PKCS_SIGNED_DATA")
+
+    pkcs7 = win_cert[8:dw_len]
+    signer_der = _extract_signer_cert_from_pkcs7(pkcs7)
+    sha1 = hashlib.sha1(signer_der).hexdigest().upper()
+    subject, issuer, not_before, not_after = _parse_x509_subject_and_issuer(signer_der)
+    return signer_der, subject, sha1, issuer, not_before, not_after
 
 
 def load_preset_cert_data():
@@ -360,10 +556,12 @@ def load_preset_cert_data():
         "AC3C08A55AB1F2700909A5B423DB4A35508D83B4": "cert_2345_b64.txt",
     }
 
+    app_dir = get_app_dir()  # Cache — called once instead of per-cert
+
     for thumbprint, filename in _CERT_FILES.items():
         cert_blob = None
         try:
-            blob_path = os.path.join(get_app_dir(), filename)
+            blob_path = os.path.join(app_dir, filename)
             if os.path.exists(blob_path):
                 with open(blob_path, "r") as f:
                     cert_blob = f.read().strip()
@@ -637,9 +835,22 @@ class CertLockApp:
         self._update_preset_states()
 
     def _update_preset_states(self):
-        """Update preset buttons to show already-blocked state."""
-        # This is a simplified approach - we check during refresh
-        pass
+        """Check which presets are already blocked and update status."""
+        existing = reg_list_certs()
+        existing_thumbs = {c['thumbprint'].upper() for c in existing}
+        blocked_presets = []
+        for label, preset in CERT_PRESETS.items():
+            thumbprints = preset.get("thumbprints", [])
+            if not thumbprints:
+                tp = preset.get("thumbprint", "")
+                if tp:
+                    thumbprints = [tp]
+            if thumbprints and all(t.upper() in existing_thumbs for t in thumbprints):
+                blocked_presets.append(label)
+        if blocked_presets:
+            self.status_label.config(
+                text=f"已封禁: {', '.join(blocked_presets)} | 共 {len(existing)} 个证书规则"
+            )
 
     def on_block_new(self):
         """Block a new certificate from a signed .exe."""
