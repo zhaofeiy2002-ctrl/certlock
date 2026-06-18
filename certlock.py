@@ -39,14 +39,14 @@ CERT_PRESETS = {
         "products":   "360安全卫士 / 360浏览器 / 360驱动大师 / 360软件管家 / 360压缩",
         "cert_data":  True,  # Embedded in presets_data dict below
     },
-    "金山 (WPS/毒霸)": {
+    "金山 (毒霸/驱动精灵/WPS)": {
         "thumbprint": "91F82992D80651CDACF4D96A307F8434BA5838CC",
         "thumbprints": [
             "91F82992D80651CDACF4D96A307F8434BA5838CC",
             "C1E3BDD81C9A773163D5B47A7F50111EE00CBF71",
         ],
         "vendor":     "Beijing Kingsoft Security software Co.,Ltd",
-        "products":   "WPS Office / 金山毒霸 / 金山卫士 / 驱动精灵",
+        "products":   "金山毒霸 / 驱动精灵 / WPS Office / 金山卫士",
         "cert_data":  True,  # Embedded certs from kinsthomeui + DGSetup
     },
     "鲁大师": {
@@ -62,13 +62,6 @@ CERT_PRESETS = {
         "products":   "腾讯电脑管家 / QQ / 腾讯视频",
         "cert_data":  True,
         "find_hint":  "",
-    },
-    "驱动精灵": {
-        "thumbprint": "",
-        "vendor":     "Shenzhen DriveTheLife Software Co., Ltd.",
-        "products":   "驱动精灵 / 驱动人生",
-        "cert_data":  False,
-        "find_hint":  "下载驱动精灵安装包 (不安装)，用本工具提取证书",
     },
     "2345": {
         "thumbprint": "AC3C08A55AB1F2700909A5B423DB4A35508D83B4",
