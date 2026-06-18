@@ -86,8 +86,8 @@ python certlock.py
 |------|-------------|----------|
 | ✅ 360 (奇虎) | Beijing Qihu Technology Co., Ltd. | 360安全卫士/浏览器/驱动大师/软件管家 |
 | 📂 金山 | Zhuhai Kingsoft Office Software Co., Ltd. | WPS/金山毒霸/金山卫士 |
-| 📂 鲁大师 | Chengdu Qiying Technology Co., Ltd. | 鲁大师/手机助手 |
-| 📂 腾讯电脑管家 | Tencent Technology (Shenzhen) Company Limited | 电脑管家/QQ |
+| ✅ 鲁大师 | Chengdu Qiying Technology Co., Ltd. | 鲁大师/手机助手 |
+| ✅ 腾讯电脑管家 | Tencent Technology (Shenzhen) Company Limited | 电脑管家/QQ/腾讯视频 |
 | 📂 驱动精灵 | Shenzhen DriveTheLife Software Co., Ltd. | 驱动精灵/驱动人生 |
 | 📂 2345 | Shanghai 2345 Mobile Technology Co., Ltd. | 2345浏览器/好压/看图王 |
 

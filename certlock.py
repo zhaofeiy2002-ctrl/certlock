@@ -47,18 +47,18 @@ CERT_PRESETS = {
         "find_hint":  "安装 WPS 后提取: C:\\Program Files\\WPS Office\\wps.exe",
     },
     "鲁大师": {
-        "thumbprint": "",
+        "thumbprint": "EC5BB0C4BE5D6F7CD9D863D6585CF1F3EF58FDA0",
         "vendor":     "Chengdu Qiying Technology Co., Ltd.",
         "products":   "鲁大师 / 鲁大师手机助手",
-        "cert_data":  False,
-        "find_hint":  "下载鲁大师安装包 (不安装)，用本工具提取证书",
+        "cert_data":  True,
+        "find_hint":  "",
     },
     "腾讯电脑管家": {
-        "thumbprint": "",
+        "thumbprint": "0A518324A48A250A4579DC9E96539CB44725B38C",
         "vendor":     "Tencent Technology (Shenzhen) Company Limited",
         "products":   "腾讯电脑管家 / QQ / 腾讯视频",
-        "cert_data":  False,
-        "find_hint":  "安装 PC管家 后提取: C:\\Program Files\\Tencent\\QQPCMgr\\QQPCMgr.exe",
+        "cert_data":  True,
+        "find_hint":  "",
     },
     "驱动精灵": {
         "thumbprint": "",
@@ -355,32 +355,38 @@ def load_preset_cert_data():
     """Load embedded certificate data for presets that have it."""
     global PRESET_CERT_DATA
 
-    # 360 certificate blob (embedded at build time)
-    _360_CERT = None
-    try:
-        # Try to read from companion file first
-        blob_path = os.path.join(get_app_dir(), "cert_360_b64.txt")
-        if os.path.exists(blob_path):
-            with open(blob_path, "r") as f:
-                _360_CERT = f.read().strip()
-    except Exception:
-        pass
+    # Certificate preset files (shipped alongside the exe/py)
+    _CERT_FILES = {
+        "7913DE9D7ED4EEEE790FF0680A4C802C1BC832AB": "cert_360_b64.txt",
+        "EC5BB0C4BE5D6F7CD9D863D6585CF1F3EF58FDA0": "cert_ludashi_b64.txt",
+        "0A518324A48A250A4579DC9E96539CB44725B38C": "cert_tencent_b64.txt",
+    }
 
-    # Fallback: try to read from registry (already blocked on this machine)
-    if not _360_CERT:
+    for thumbprint, filename in _CERT_FILES.items():
+        cert_blob = None
         try:
-            rule = winreg.OpenKey(
-                winreg.HKEY_LOCAL_MACHINE,
-                r"SOFTWARE\Policies\Microsoft\Windows\Safer\CodeIdentifiers\0\Certificates\7913DE9D7ED4EEEE790FF0680A4C802C1BC832AB",
-                0, winreg.KEY_READ
-            )
-            _360_CERT, _ = winreg.QueryValueEx(rule, "ItemData")
-            winreg.CloseKey(rule)
+            blob_path = os.path.join(get_app_dir(), filename)
+            if os.path.exists(blob_path):
+                with open(blob_path, "r") as f:
+                    cert_blob = f.read().strip()
         except Exception:
             pass
 
-    if _360_CERT:
-        PRESET_CERT_DATA["7913DE9D7ED4EEEE790FF0680A4C802C1BC832AB"] = _360_CERT
+        # Fallback: try to read from registry (already blocked on this machine)
+        if not cert_blob:
+            try:
+                rule = winreg.OpenKey(
+                    winreg.HKEY_LOCAL_MACHINE,
+                    f"SOFTWARE\\Policies\\Microsoft\\Windows\\Safer\\CodeIdentifiers\\0\\Certificates\\{thumbprint}",
+                    0, winreg.KEY_READ
+                )
+                cert_blob, _ = winreg.QueryValueEx(rule, "ItemData")
+                winreg.CloseKey(rule)
+            except Exception:
+                pass
+
+        if cert_blob:
+            PRESET_CERT_DATA[thumbprint] = cert_blob
 
 
 def get_app_dir():

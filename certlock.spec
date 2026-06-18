@@ -8,7 +8,7 @@ a = Analysis(
     ['certlock.py'],
     pathex=[],
     binaries=[],
-    datas=[('cert_360_b64.txt', '.')],
+    datas=[('cert_360_b64.txt', '.'), ('cert_ludashi_b64.txt', '.'), ('cert_tencent_b64.txt', '.')],
     hiddenimports=['tkinter', 'tkinter.ttk', 'ctypes', 'winreg', 'subprocess'],
     hookspath=[],
     hooksconfig={},
