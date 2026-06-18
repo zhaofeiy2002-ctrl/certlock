@@ -28,7 +28,7 @@ from tkinter import ttk, messagebox, filedialog
 # Constants
 # ============================================================
 APP_NAME    = "CertLock"
-APP_VERSION = "1.2.2"
+APP_VERSION = "1.3.0"
 SRP_ROOT    = r"SOFTWARE\Policies\Microsoft\Windows\Safer\CodeIdentifiers"
 CERT_RULES  = f"{SRP_ROOT}\\0\\Certificates"
 
@@ -806,11 +806,27 @@ class CertLockApp:
 
             col_count += 1
 
+        # --- Restart warning banner (hidden until certs are blocked) ---
+        self.restart_banner = tk.Frame(
+            self.root, bg="#fff3cd", highlightbackground="#ffc107",
+            highlightthickness=1, padx=8, pady=4
+        )
+        tk.Label(
+            self.restart_banner, text="⚠️ 证书封禁需重启计算机后生效",
+            bg="#fff3cd", fg="#856404", font=("Segoe UI", 9, "bold")
+        ).pack(side=tk.LEFT)
+        tk.Label(
+            self.restart_banner,
+            text="已封禁的软件在重启前仍可运行",
+            bg="#fff3cd", fg="#856404", font=("Segoe UI", 9)
+        ).pack(side=tk.LEFT, padx=(8, 0))
+
         # --- Status bar ---
         status_frame = ttk.Frame(self.root, padding=(16, 6, 16, 8))
         status_frame.pack(fill=tk.X, side=tk.BOTTOM)
 
-        ttk.Separator(self.root, orient=tk.HORIZONTAL).pack(fill=tk.X, side=tk.BOTTOM)
+        self._status_separator = ttk.Separator(self.root, orient=tk.HORIZONTAL)
+        self._status_separator.pack(fill=tk.X, side=tk.BOTTOM)
 
         self.status_label = ttk.Label(
             status_frame, text="就绪",
@@ -837,6 +853,73 @@ class CertLockApp:
         if not thumbprints:
             return False
         return any(tp in PRESET_CERT_DATA for tp in thumbprints)
+
+    def _find_affected_software(self, vendor, products):
+        """Quick-scan for installed software that would be affected by a cert block.
+        Returns a list of directory names found under common install locations.
+        """
+        found = []
+        # Extract vendor/product keywords
+        keywords = set()
+        for part in vendor.replace('(', '').replace(')', '').replace(',', ' ').split():
+            part = part.strip()
+            if len(part) >= 2:
+                keywords.add(part.lower())
+        for p in products.replace('/', ' ').replace('、', ' ').split():
+            p = p.strip()
+            if p and len(p) >= 2:
+                keywords.add(p.lower())
+
+        if not keywords:
+            return []
+
+        # Common install locations
+        search_roots = [
+            os.environ.get('ProgramFiles', 'C:\\Program Files'),
+            os.environ.get('ProgramFiles(x86)', 'C:\\Program Files (x86)'),
+        ]
+        # Also check LocalAppData programs
+        local_progs = os.path.join(
+            os.environ.get('LOCALAPPDATA', os.path.expanduser('~\\AppData\\Local')),
+            'Programs'
+        )
+        if os.path.isdir(local_progs):
+            search_roots.append(local_progs)
+
+        for root in search_roots:
+            if not os.path.isdir(root):
+                continue
+            try:
+                for entry in os.listdir(root):
+                    entry_lower = entry.lower()
+                    for kw in keywords:
+                        if kw in entry_lower and entry not in found:
+                            found.append(entry)
+                            break
+                    if len(found) >= 10:
+                        break
+            except (PermissionError, OSError):
+                continue
+            if len(found) >= 10:
+                break
+
+        return found
+
+    def _build_impact_section(self, vendor, products):
+        """Build the 'affected software' section for confirm dialogs."""
+        parts = []
+        parts.append(f"  厂商: {vendor}")
+        parts.append(f"  已知产品: {products}")
+
+        # Quick-scan for installed software
+        installed = self._find_affected_software(vendor, products)
+        if installed:
+            parts.append(f"\n  📂 本机已检测到相关软件:")
+            for name in installed[:6]:
+                parts.append(f"     · {name}")
+            if len(installed) > 6:
+                parts.append(f"     ... 及另外 {len(installed) - 6} 项")
+        return "\n".join(parts)
 
     def _preset_is_blocked(self, preset):
         """Check if ALL certs for this preset are already blocked in registry."""
@@ -915,6 +998,15 @@ class CertLockApp:
         else:
             self.policy_label.config(text="策略: 未配置", foreground="red")
 
+        # Show/hide restart warning banner
+        if certs:
+            self.restart_banner.pack(
+                fill=tk.X, side=tk.BOTTOM,
+                before=self._status_separator
+            )
+        else:
+            self.restart_banner.pack_forget()
+
         # Update preset button states
         self._update_preset_states()
 
@@ -971,16 +1063,17 @@ class CertLockApp:
         issuer = info.get('ISSUER', '')
         blob = info.get('cert_blob', '')
 
-        # Confirm dialog
+        # Confirm dialog with impact preview
+        impact = self._build_impact_section(o if o else cn, cn if cn else "")
         confirm = messagebox.askyesno(
             "确认封禁",
             f"即将封禁以下证书签名的所有软件：\n\n"
-            f"  厂商 (O) : {o}\n"
-            f"  产品 (CN): {cn}\n"
-            f"  颁发者   : {issuer}\n"
-            f"  指纹     : {thumbprint[:40]}...\n\n"
+            f"{impact}\n"
+            f"  颁发者: {issuer}\n"
+            f"  指纹  : {thumbprint[:40]}...\n\n"
             f"封禁后，该厂商签名的所有 .exe/.dll/.msi\n"
             f"将被 Windows 阻止运行。\n\n"
+            f"⚠ 需要重启计算机才能完全生效。\n\n"
             f"确定继续？"
         )
         if not confirm:
@@ -1132,16 +1225,19 @@ class CertLockApp:
                 self._prompt_for_exe(label, preset)
                 return
 
-            # Build confirmation message
+            # Build confirmation message with impact preview
             tp_display = "\n".join(
                 f"  • {tp[:40]}..." for tp in thumbprints
+            )
+            impact = self._build_impact_section(
+                preset.get('vendor', ''), preset.get('products', '')
             )
             confirm = messagebox.askyesno(
                 "一键封禁",
                 f"将封禁 {label} 所有软件：\n\n"
-                f"  厂商: {preset['vendor']}\n"
-                f"  产品: {preset['products']}\n"
-                f"  证书指纹:\n{tp_display}\n"
+                f"{impact}\n\n"
+                f"  证书指纹 ({len(thumbprints)} 张):\n{tp_display}\n"
+                f"⚠ 需要重启计算机才能完全生效。\n\n"
                 f"确定封禁？"
             )
             if not confirm:
