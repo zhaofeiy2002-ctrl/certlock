@@ -1314,7 +1314,7 @@ class CertLockApp:
         )
         self.btn_export.pack(side=tk.RIGHT, padx=(4, 0))
 
-        # === Button bar row 2: strategy management ===
+        # === Button bar row 2: strategy & template management ===
         btn_row2 = ttk.Frame(main_frame)
         btn_row2.pack(fill=tk.X, pady=(0, 8))
 
@@ -1328,19 +1328,19 @@ class CertLockApp:
             btn_row2, text="📥 还原策略",
             command=self.on_restore, width=16
         )
-        self.btn_restore.pack(side=tk.LEFT, padx=(0, 4))
-
-        self.btn_template_import = ttk.Button(
-            btn_row2, text="📥 导入模板",
-            command=self.on_import_template, width=14
-        )
-        self.btn_template_import.pack(side=tk.LEFT, padx=(0, 4))
+        self.btn_restore.pack(side=tk.LEFT)
 
         self.btn_template_export = ttk.Button(
             btn_row2, text="📋 导出模板",
             command=self.on_export_template, width=14
         )
-        self.btn_template_export.pack(side=tk.LEFT)
+        self.btn_template_export.pack(side=tk.RIGHT)
+
+        self.btn_template_import = ttk.Button(
+            btn_row2, text="📥 导入模板",
+            command=self.on_import_template, width=14
+        )
+        self.btn_template_import.pack(side=tk.RIGHT, padx=(0, 4))
 
         # Separator
         ttk.Separator(main_frame, orient=tk.HORIZONTAL).pack(fill=tk.X)
