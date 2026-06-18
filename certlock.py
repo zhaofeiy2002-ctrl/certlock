@@ -1199,13 +1199,15 @@ class CertLockApp:
             schemes = {
                 'available': ('#1a3a2a', '#8fd19e', '#28a745', '已内置 · 点击封禁'),
                 'no_data':   ('#2d2d30', '#8e8e93', '#3e3e42', '需提供安装包或下载证书数据'),
-                'blocked':   ('#1a2a4a', '#8fbcff', '#007bff', '已封禁 ✓'),
+                'blocked':   ('#1a2a4a', '#8fbcff', '#007bff', '已封禁 ✓ · 右键重新扫描'),
+                'expired':   ('#3d3200', '#ffc107', '#856404', '⚠ 证书已过期 · 右键重新扫描'),
             }
         else:
             schemes = {
                 'available': ('#d4edda', '#155724', '#28a745', '已内置 · 点击封禁'),
                 'no_data':   ('#e9ecef', '#6c757d', '#ced4da', '需提供安装包或下载证书数据'),
-                'blocked':   ('#cce5ff', '#004085', '#007bff', '已封禁 ✓'),
+                'blocked':   ('#cce5ff', '#004085', '#007bff', '已封禁 ✓ · 右键重新扫描'),
+                'expired':   ('#fff3cd', '#856404', '#ffc107', '⚠ 证书已过期 · 右键重新扫描'),
             }
         bg, fg, border, label = schemes[state]
         return {'bg': bg, 'fg': fg, 'border': border, 'label': label}
@@ -1364,9 +1366,16 @@ class CertLockApp:
                 row_frame.pack(fill=tk.X, pady=1)
                 col_count = 0
 
-            # Determine actual state (not just metadata flag)
-            has_cert_data = self._preset_has_cert_data(preset)
-            state = 'available' if has_cert_data else 'no_data'
+            # Determine actual state (registry + cert data + expiry)
+            if self._preset_is_blocked(preset):
+                if self._preset_cert_expired(preset):
+                    state = 'expired'
+                else:
+                    state = 'blocked'
+            elif self._preset_has_cert_data(preset):
+                state = 'available'
+            else:
+                state = 'no_data'
             colors = self._preset_colors(state)
 
             # Card frame
@@ -1392,9 +1401,10 @@ class CertLockApp:
             )
             hint_lbl.pack(fill=tk.X, padx=10, pady=(0, 8))
 
-            # Bind click to all elements in the card
+            # Bind click and right-click to all elements in the card
             for w in (card, name_lbl, hint_lbl):
                 w.bind('<Button-1>', lambda e, l=label, p=preset: self.on_preset_click(l, p))
+                w.bind('<Button-3>', lambda e, l=label, p=preset: self._on_preset_right_click(e, l, p))
                 w.bind('<Enter>', lambda e, c=card, cl=colors: self._on_card_hover(c, cl, True))
                 w.bind('<Leave>', lambda e, c=card, cl=colors: self._on_card_hover(c, cl, False))
 
@@ -1614,6 +1624,25 @@ class CertLockApp:
         existing_thumbs = {c['thumbprint'].upper() for c in existing}
         return all(t.upper() in existing_thumbs for t in thumbprints)
 
+    def _preset_cert_expired(self, preset):
+        """Check if all embedded cert data for this preset have expired."""
+        thumbprints = preset.get("thumbprints", [])
+        if not thumbprints:
+            tp = preset.get("thumbprint", "")
+            if tp:
+                thumbprints = [tp]
+        if not thumbprints:
+            return False
+        has_blobs = False
+        for tp in thumbprints:
+            blob = PRESET_CERT_DATA.get(tp, "")
+            if blob:
+                has_blobs = True
+                expired, _ = _check_cert_expiry(blob)
+                if not expired:
+                    return False
+        return has_blobs
+
     def _on_card_hover(self, card, colors, entering):
         """Hover highlight effect for preset cards."""
         try:
@@ -1624,6 +1653,58 @@ class CertLockApp:
         except Exception:
             pass
 
+    def _on_preset_right_click(self, event, label, preset):
+        """Right-click context menu for preset cards."""
+        menu = tk.Menu(self.root, tearoff=0)
+        menu.add_command(
+            label="🔄 重新扫描 — 提取该厂商最新证书",
+            command=lambda: self._prompt_for_exe(label, preset)
+        )
+        is_blocked = self._preset_is_blocked(preset)
+        menu.add_command(
+            label="📋 查看证书详情",
+            command=lambda: self._show_preset_detail(label, preset)
+        )
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    def _show_preset_detail(self, label, preset):
+        """Show certificate detail info for a preset."""
+        thumbprints = preset.get("thumbprints", [])
+        if not thumbprints:
+            tp = preset.get("thumbprint", "")
+            if tp:
+                thumbprints = [tp]
+        vendor = preset.get("vendor", "未知")
+        products = preset.get("products", "未知")
+        tp_list = "\n  ".join(tp[:40] + "..." for tp in thumbprints)
+
+        is_blocked = self._preset_is_blocked(preset)
+        has_data = self._preset_has_cert_data(preset)
+        is_expired = self._preset_cert_expired(preset)
+
+        status = "已封禁 ✓"
+        if is_expired:
+            status = "⚠ 已封禁但证书已过期（厂商可能换证）"
+        elif is_blocked:
+            status = "已封禁 ✓"
+        elif has_data:
+            status = "未封禁（点击封禁）"
+        else:
+            status = "未封禁（需提供安装包）"
+
+        messagebox.showinfo(
+            f"{label} — 证书详情",
+            f"厂商: {vendor}\n"
+            f"产品: {products}\n"
+            f"状态: {status}\n"
+            f"证书数: {len(thumbprints)} 张\n"
+            f"指纹:\n  {tp_list}\n\n"
+            f"提示: 右键卡片可重新扫描提取新证书。"
+        )
+
     def _refresh_preset_cards(self):
         """Update preset card colors based on current registry state."""
         if not hasattr(self, 'preset_cards'):
@@ -1633,7 +1714,10 @@ class CertLockApp:
             if not widgets:
                 continue
             if self._preset_is_blocked(preset):
-                state = 'blocked'
+                if self._preset_cert_expired(preset):
+                    state = 'expired'
+                else:
+                    state = 'blocked'
             elif self._preset_has_cert_data(preset):
                 state = 'available'
             else:
@@ -1939,11 +2023,23 @@ class CertLockApp:
         already_blocked = all(t.upper() in existing_thumbs for t in thumbprints)
 
         if already_blocked:
-            messagebox.showinfo(
-                "已封禁",
-                f"{label} 已被封禁，无需重复操作。\n\n"
-                f"指纹: {thumbprints[0][:40]}..."
-            )
+            if self._preset_cert_expired(preset):
+                rescan = messagebox.askyesno(
+                    "证书已过期 — 建议重新扫描",
+                    f"{label} 已被封禁，但内置证书已过期。\n\n"
+                    f"厂商可能已更换新证书，旧封禁可能无法\n"
+                    f"覆盖最新版本的软件。\n\n"
+                    f"是否选择该厂商最新安装包以提取新证书？"
+                )
+                if rescan:
+                    self._prompt_for_exe(label, preset)
+            else:
+                messagebox.showinfo(
+                    "已封禁",
+                    f"{label} 已被封禁，无需重复操作。\n\n"
+                    f"如厂商更换了证书，请右键卡片选择「重新扫描」。\n\n"
+                    f"指纹: {thumbprints[0][:40]}..."
+                )
             return
 
         has_data = preset.get("cert_data", False)
