@@ -126,9 +126,12 @@ def elevate():
     """Re-launch self with administrator privileges."""
     if is_admin():
         return True
+    # IMPORTANT: pass NO parameters — argparse treats an extra file path as an
+    # unrecognized positional argument and calls sys.exit(), which silently kills
+    # the GUI before any window appears.
     ctypes.windll.shell32.ShellExecuteW(
         None, "runas", sys.executable,
-        f'"{os.path.abspath(__file__)}"', None, 1
+        None, None, 1
     )
     return False
 
@@ -1277,64 +1280,67 @@ class CertLockApp:
         self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
 
-        # Button bar
-        btn_frame = ttk.Frame(main_frame)
-        btn_frame.pack(fill=tk.X, pady=(0, 8))
+        # === Button bar row 1: certificate operations ===
+        btn_row1 = ttk.Frame(main_frame)
+        btn_row1.pack(fill=tk.X, pady=(0, 4))
 
         self.btn_block = ttk.Button(
-            btn_frame, text="➕ 封禁新证书",
+            btn_row1, text="➕ 封禁新证书",
             command=self.on_block_new, width=16
         )
-        self.btn_block.pack(side=tk.LEFT, padx=(0, 6))
+        self.btn_block.pack(side=tk.LEFT, padx=(0, 4))
 
         self.btn_block_hash = ttk.Button(
-            btn_frame, text="🔒 封禁文件(哈希)",
-            command=self.on_block_hash, width=16
+            btn_row1, text="🔒 封禁文件(哈希)",
+            command=self.on_block_hash, width=18
         )
         # Hidden until hash view is active
 
         self.btn_remove = ttk.Button(
-            btn_frame, text="✖ 移除选中",
+            btn_row1, text="✖ 移除选中",
             command=self.on_remove, width=14
         )
-        self.btn_remove.pack(side=tk.LEFT, padx=(0, 6))
+        self.btn_remove.pack(side=tk.LEFT, padx=(0, 4))
 
         self.btn_refresh = ttk.Button(
-            btn_frame, text="↻ 刷新列表",
+            btn_row1, text="↻ 刷新列表",
             command=self.refresh_list, width=14
         )
         self.btn_refresh.pack(side=tk.LEFT)
 
-        # Right-side buttons
-        self.btn_template_import = ttk.Button(
-            btn_frame, text="📥 导入模板",
-            command=self.on_import_template, width=14
-        )
-        self.btn_template_import.pack(side=tk.RIGHT, padx=(6, 0))
-
-        self.btn_template_export = ttk.Button(
-            btn_frame, text="📋 导出模板",
-            command=self.on_export_template, width=14
-        )
-        self.btn_template_export.pack(side=tk.RIGHT, padx=(0, 0))
-
         self.btn_export = ttk.Button(
-            btn_frame, text="💾 导出证书",
+            btn_row1, text="💾 导出证书",
             command=self.on_export, width=14
         )
-        self.btn_export.pack(side=tk.RIGHT, padx=(6, 0))
+        self.btn_export.pack(side=tk.RIGHT, padx=(4, 0))
 
-        self.btn_restore = ttk.Button(
-            btn_frame, text="📥 还原策略",
-            command=self.on_restore, width=14
-        )
-        self.btn_restore.pack(side=tk.RIGHT, padx=(0, 0))
+        # === Button bar row 2: strategy management ===
+        btn_row2 = ttk.Frame(main_frame)
+        btn_row2.pack(fill=tk.X, pady=(0, 8))
 
         self.btn_backup = ttk.Button(
-            btn_frame, text="📤 备份策略",
-            command=self.on_backup, width=14
+            btn_row2, text="📤 备份策略",
+            command=self.on_backup, width=16
         )
-        self.btn_backup.pack(side=tk.RIGHT, padx=(0, 6))
+        self.btn_backup.pack(side=tk.LEFT, padx=(0, 4))
+
+        self.btn_restore = ttk.Button(
+            btn_row2, text="📥 还原策略",
+            command=self.on_restore, width=16
+        )
+        self.btn_restore.pack(side=tk.LEFT, padx=(0, 4))
+
+        self.btn_template_import = ttk.Button(
+            btn_row2, text="📥 导入模板",
+            command=self.on_import_template, width=14
+        )
+        self.btn_template_import.pack(side=tk.LEFT, padx=(0, 4))
+
+        self.btn_template_export = ttk.Button(
+            btn_row2, text="📋 导出模板",
+            command=self.on_export_template, width=14
+        )
+        self.btn_template_export.pack(side=tk.LEFT)
 
         # Separator
         ttk.Separator(main_frame, orient=tk.HORIZONTAL).pack(fill=tk.X)
@@ -2166,18 +2172,14 @@ class CertLockApp:
             self.list_title.config(text="已封禁哈希列表")
             self.btn_toggle_view.config(text="查看证书规则")
             self.btn_block.pack_forget()
-            self.btn_block_hash.pack(side=tk.LEFT, padx=(0, 6))
+            self.btn_block_hash.pack(side=tk.LEFT, padx=(0, 4), before=self.btn_remove)
             self.btn_export.pack_forget()
-            before_widget = self.btn_template_import
-            self.btn_block_hash.pack(
-                side=tk.LEFT, padx=(0, 6), before=self.btn_remove
-            )
         else:
             self.list_title.config(text="已封禁证书列表")
             self.btn_toggle_view.config(text="查看哈希规则")
             self.btn_block_hash.pack_forget()
-            self.btn_block.pack(side=tk.LEFT, padx=(0, 6), before=self.btn_remove)
-            self.btn_export.pack(side=tk.RIGHT, padx=(6, 0), before=self.btn_template_export)
+            self.btn_block.pack(side=tk.LEFT, padx=(0, 4), before=self.btn_remove)
+            self.btn_export.pack(side=tk.RIGHT, padx=(4, 0))
         self.refresh_list()
 
     def on_block_hash(self):
@@ -2728,7 +2730,11 @@ def _parse_args():
                        help='导入社区模板 JSON')
     parser.add_argument('--version', action='version',
                        version=f'{APP_NAME} v{APP_VERSION}')
-    return parser.parse_args()
+    # parse_known_args is robust to extra args (e.g., from ShellExecute
+    # elevation) — unrecognized positional args are ignored instead of
+    # causing a silent sys.exit().
+    known, _unknown = parser.parse_known_args()
+    return known
 
 
 def _cli_list(fmt="text"):
