@@ -28,7 +28,7 @@ from tkinter import ttk, messagebox, filedialog
 # Constants
 # ============================================================
 APP_NAME    = "CertLock"
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.2.1"
 SRP_ROOT    = r"SOFTWARE\Policies\Microsoft\Windows\Safer\CodeIdentifiers"
 CERT_RULES  = f"{SRP_ROOT}\\0\\Certificates"
 
@@ -586,9 +586,10 @@ def load_preset_cert_data():
 
 
 def get_app_dir():
-    """Get the directory containing this script/exe."""
+    """Get the directory containing resources (script dir or PyInstaller temp)."""
     if getattr(sys, 'frozen', False):
-        return os.path.dirname(sys.executable)
+        # PyInstaller extracts bundled files to _MEIPASS, NOT next to the .exe
+        return sys._MEIPASS
     return os.path.dirname(os.path.abspath(__file__))
 
 
@@ -739,45 +740,71 @@ class CertLockApp:
             font=("Segoe UI", 10, "bold")
         ).pack(side=tk.LEFT)
         ttk.Label(
-            preset_header, text="绿色=已内置证书  灰色=需提供安装包",
+            preset_header, text="🟢 已内置证书  |  ⚪ 需提供安装包  |  🔵 已封禁",
             style="Status.TLabel", foreground="gray"
         ).pack(side=tk.LEFT, padx=(8, 0))
 
-        # Preset buttons (wrapping frame)
+        # Preset cards container (wrapping rows, no empty fillers)
         preset_frame = ttk.Frame(main_frame)
         preset_frame.pack(fill=tk.X, pady=(2, 8))
 
-        row_frame = None
+        # Color schemes
+        self.PRESET_COLORS = {
+            'available': {'bg': '#d4edda', 'fg': '#155724', 'border': '#28a745', 'label': '已内置 · 点击封禁'},
+            'no_data':   {'bg': '#e9ecef', 'fg': '#6c757d', 'border': '#ced4da', 'label': '需提供安装包'},
+            'blocked':   {'bg': '#cce5ff', 'fg': '#004085', 'border': '#007bff', 'label': '已封禁 ✓'},
+        }
+
+        self.preset_cards = {}  # label -> widget dict for live color updates
+        row_frame = ttk.Frame(preset_frame)
+        row_frame.pack(fill=tk.X, pady=1)
         col_count = 0
-        max_cols = 3
 
         for label, preset in CERT_PRESETS.items():
-            if col_count == 0:
+            if col_count >= 3:
                 row_frame = ttk.Frame(preset_frame)
-                row_frame.pack(fill=tk.X, pady=2)
-
-            has_data = preset.get("cert_data", False)
-            # Check if already blocked
-            already_blocked = False
-            if preset.get("thumbprint"):
-                for item in self.tree.get_children():
-                    pass  # Will be checked at runtime
-
-            btn_text = f"{'✅ ' if has_data else '📂 '}{label}"
-            btn = ttk.Button(
-                row_frame, text=btn_text,
-                style="Preset.TButton",
-                command=lambda l=label, p=preset: self.on_preset_click(l, p)
-            )
-            btn.pack(side=tk.LEFT, padx=(0, 4), fill=tk.X, expand=True)
-            col_count += 1
-            if col_count >= max_cols:
+                row_frame.pack(fill=tk.X, pady=1)
                 col_count = 0
 
-        # Fill remaining space
-        if col_count > 0:
-            for _ in range(max_cols - col_count):
-                ttk.Frame(row_frame).pack(side=tk.LEFT, fill=tk.X, expand=True)
+            # Determine actual state (not just metadata flag)
+            has_cert_data = self._preset_has_cert_data(preset)
+            state = 'available' if has_cert_data else 'no_data'
+            colors = self.PRESET_COLORS[state]
+
+            # Card frame
+            card = tk.Frame(
+                row_frame, bg=colors['bg'],
+                highlightbackground=colors['border'],
+                highlightthickness=1, cursor='hand2',
+                relief=tk.FLAT
+            )
+            card.pack(side=tk.LEFT, padx=2, fill=tk.X, expand=True)
+
+            # Vendor name
+            name_lbl = tk.Label(
+                card, text=label, bg=colors['bg'], fg=colors['fg'],
+                font=('Segoe UI', 9, 'bold'), cursor='hand2', anchor='center'
+            )
+            name_lbl.pack(fill=tk.X, padx=10, pady=(8, 0))
+
+            # Status hint
+            hint_lbl = tk.Label(
+                card, text=colors['label'], bg=colors['bg'], fg=colors['fg'],
+                font=('Segoe UI', 7), cursor='hand2', anchor='center'
+            )
+            hint_lbl.pack(fill=tk.X, padx=10, pady=(0, 8))
+
+            # Bind click to all elements in the card
+            for w in (card, name_lbl, hint_lbl):
+                w.bind('<Button-1>', lambda e, l=label, p=preset: self.on_preset_click(l, p))
+                w.bind('<Enter>', lambda e, c=card, cl=colors: self._on_card_hover(c, cl, True))
+                w.bind('<Leave>', lambda e, c=card, cl=colors: self._on_card_hover(c, cl, False))
+
+            self.preset_cards[label] = {
+                'card': card, 'name': name_lbl, 'hint': hint_lbl, 'state': state
+            }
+
+            col_count += 1
 
         # --- Status bar ---
         status_frame = ttk.Frame(self.root, padding=(16, 6, 16, 8))
@@ -796,6 +823,63 @@ class CertLockApp:
             style="Status.TLabel", foreground="gray"
         )
         self.policy_label.pack(side=tk.RIGHT)
+
+    # ============================================================
+    # Preset helpers
+    # ============================================================
+    def _preset_has_cert_data(self, preset):
+        """Check if preset has actually loaded cert blob data (not just metadata flag)."""
+        thumbprints = preset.get("thumbprints", [])
+        if not thumbprints:
+            tp = preset.get("thumbprint", "")
+            if tp:
+                thumbprints = [tp]
+        if not thumbprints:
+            return False
+        return any(tp in PRESET_CERT_DATA for tp in thumbprints)
+
+    def _preset_is_blocked(self, preset):
+        """Check if ALL certs for this preset are already blocked in registry."""
+        thumbprints = preset.get("thumbprints", [])
+        if not thumbprints:
+            tp = preset.get("thumbprint", "")
+            if tp:
+                thumbprints = [tp]
+        if not thumbprints:
+            return False
+        existing = reg_list_certs()
+        existing_thumbs = {c['thumbprint'].upper() for c in existing}
+        return all(t.upper() in existing_thumbs for t in thumbprints)
+
+    def _on_card_hover(self, card, colors, entering):
+        """Hover highlight effect for preset cards."""
+        try:
+            if entering:
+                card.configure(highlightthickness=2)
+            else:
+                card.configure(highlightthickness=1)
+        except Exception:
+            pass
+
+    def _refresh_preset_cards(self):
+        """Update preset card colors based on current registry state."""
+        if not hasattr(self, 'preset_cards'):
+            return
+        for label, preset in CERT_PRESETS.items():
+            widgets = self.preset_cards.get(label)
+            if not widgets:
+                continue
+            if self._preset_is_blocked(preset):
+                state = 'blocked'
+            elif self._preset_has_cert_data(preset):
+                state = 'available'
+            else:
+                state = 'no_data'
+            colors = self.PRESET_COLORS[state]
+            widgets['card'].configure(bg=colors['bg'], highlightbackground=colors['border'])
+            widgets['name'].configure(bg=colors['bg'], fg=colors['fg'])
+            widgets['hint'].configure(bg=colors['bg'], fg=colors['fg'], text=colors['label'])
+            widgets['state'] = state
 
     # ============================================================
     # Actions
@@ -835,7 +919,7 @@ class CertLockApp:
         self._update_preset_states()
 
     def _update_preset_states(self):
-        """Check which presets are already blocked and update status."""
+        """Check which presets are already blocked and update status + card colors."""
         existing = reg_list_certs()
         existing_thumbs = {c['thumbprint'].upper() for c in existing}
         blocked_presets = []
@@ -851,6 +935,8 @@ class CertLockApp:
             self.status_label.config(
                 text=f"已封禁: {', '.join(blocked_presets)} | 共 {len(existing)} 个证书规则"
             )
+        # Refresh card colors
+        self._refresh_preset_cards()
 
     def on_block_new(self):
         """Block a new certificate from a signed .exe."""
