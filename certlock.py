@@ -231,8 +231,8 @@ def reg_remove_cert(thumbprint):
             winreg.HKEY_LOCAL_MACHINE, CERT_RULES, 0,
             winreg.KEY_ALL_ACCESS | winreg.KEY_WOW64_64KEY
         )
-        # Use DeleteKey via ctypes since winreg.DeleteKey won't delete keys with values
-        # Alternative: delete values first, then key
+        # Delete values first, then key (belt-and-suspenders — DeleteKey
+        # actually handles keys with values, but only fails on subkeys)
         try:
             rule = winreg.OpenKey(
                 winreg.HKEY_LOCAL_MACHINE, rule_path, 0,
@@ -529,8 +529,8 @@ def _parse_x509_subject_and_issuer(der_bytes):
             not_before_off = vseq_val
             _, _, nb_val, nb_end = _read_tlv(der_bytes, not_before_off)
             not_before = der_bytes[nb_val:nb_end].decode('ascii', errors='replace')
-            _, _, na_val, _ = _read_tlv(der_bytes, nb_end)
-            not_after = der_bytes[na_val:na_val + (nb_end - nb_val)].decode('ascii', errors='replace')
+            _, _, na_val, na_end = _read_tlv(der_bytes, nb_end)
+            not_after = der_bytes[na_val:na_end].decode('ascii', errors='replace')
         except Exception:
             not_before, not_after = "", ""
         # subject
