@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-CertLock v1.4.0 — Windows Certificate Blocker
+CertLock v1.4.1 — Windows Certificate Blocker
 =============================================
 A lightweight GUI tool to block unwanted software via Windows
 Software Restriction Policy (SRP) certificate rules.
@@ -31,9 +31,9 @@ from tkinter import ttk, messagebox, filedialog
 # Constants
 # ============================================================
 APP_NAME    = "CertLock"
-APP_VERSION = "1.4.0"
+APP_VERSION = "1.4.1"
 SRP_ROOT    = r"SOFTWARE\Policies\Microsoft\Windows\Safer\CodeIdentifiers"
-CERT_RULES  = f"{SRP_ROOT}\\0\\Certificates"
+CERT_RULES  = SRP_ROOT + "\\0\\Certificates"
 
 # Built-in certificate presets
 # Format: { "label": { "thumbprint", "vendor", "products", "cert_data"(optional) } }
@@ -175,7 +175,8 @@ def reg_list_certs():
         winreg.CloseKey(certs)
         winreg.CloseKey(srp)
     except Exception as e:
-        pass  # Silently handle - GUI will show empty state
+        import sys
+        print(f"[CertLock] reg_list_certs failed: {e}", file=sys.stderr)
     return results
 
 

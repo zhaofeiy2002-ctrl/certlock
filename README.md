@@ -3,7 +3,7 @@
 > **Windows 证书封禁工具 — 永久阻止流氓软件运行**  
 > 单文件 · 便携 · 无残留 · ZyperWin++ 风格
 
-![Version](https://img.shields.io/badge/version-1.4.0-blue)
+![Version](https://img.shields.io/badge/version-1.4.1-blue)
 ![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-lightgrey)
 ![License](https://img.shields.io/badge/license-MIT-green)
 ![Python](https://img.shields.io/badge/python-3.6%2B-yellow)
@@ -75,7 +75,7 @@ CertLock 是一款轻量级 Windows 安全工具，通过调用系统原生的 *
 
 ### 方式 1：下载 .exe（推荐）
 
-[**⬇️ 下载 CertLock_v1.4.0.zip**](https://github.com/zhaofeiy2002-ctrl/certlock/raw/master/CertLock_v1.4.0.zip)（~11 MB）
+[**⬇️ 下载 CertLock_v1.4.1.zip**](https://github.com/zhaofeiy2002-ctrl/certlock/raw/master/CertLock_v1.4.1.zip)（~11 MB）
 
 解压后 **右键 `CertLock.exe` → 以管理员身份运行**，即刻使用。
 
