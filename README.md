@@ -8,8 +8,42 @@
 ![License](https://img.shields.io/badge/license-MIT-green)
 ![Python](https://img.shields.io/badge/python-3.6%2B-yellow)
 ![Build](https://img.shields.io/badge/build-PyInstaller-orange)
+[![VirusTotal](https://img.shields.io/badge/VirusTotal-dropper_(误报)-red)](https://www.virustotal.com/gui/file/1d130359917d92aba83e56737b2c88488dd0471b2926163d715408bdfbe957f0)
 
 ![Stars](https://img.shields.io/github/stars/zhaofeiy2002-ctrl/certlock?style=social)
+
+---
+
+## ⚠️ 下载前必读 — 杀毒软件会报毒
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                                                                     │
+│   🔴 本工具会被 VirusTotal 部分引擎标记为 dropper / malware         │
+│   🔴 Windows Defender 可能拦截下载或直接删除文件                     │
+│   🔴 浏览器（Edge/Chrome）可能阻止下载                               │
+│                                                                     │
+│   ✅ 这是 PyInstaller 单文件打包的已知误报，并非病毒               │
+│   ✅ 100% 开源，每行代码可审计 → github.com/zhaofeiy2002-ctrl/certlock│
+│   ✅ 仅写入 Windows 原生注册表策略，不联网、不加驱、不驻留          │
+│                                                                     │
+│   📋 VirusTotal 报告：                                              │
+│   🔗 https://www.virustotal.com/gui/file/1d13035991...              │
+│   🏷️  Popular threat label: dropper                                │
+│                                                                     │
+│   ⚠️  下载前请临时关闭 Windows Defender 实时防护                    │
+│   ⚠️  或将下载目录加入杀毒软件排除列表                              │
+│   ⚠️  下载完成后可重新开启防护                                      │
+│                                                                     │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+| 你为什么应该信任这个 exe | 为什么杀软还是会报 |
+|--------------------------|-------------------|
+| 源码公开，MIT 协议，人人可审计 | PyInstaller 单文件 exe 行为像 dropper（解压到 %TEMP%、启动子进程） |
+| 只写注册表，不做任何联网操作 | 无数字签名（个人开发者无法负担每年 $300+ 的代码签名证书） |
+| 调用的全部是 Windows 公开 API（winreg / gpupdate） | 小众工具，杀毒引擎没有白名单收录 |
+| VirusTotal 标记为 dropper 是**行为特征匹配**，不是恶意代码检出 | 流氓软件的安装包同样无签名 → 行为模式相似 |
 
 ---
 
