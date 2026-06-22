@@ -28,11 +28,11 @@
 │   ✅ 100% 开源，每行代码可审计 → github.com/zhaofeiy2002-ctrl/certlock│
 │   ✅ 仅写入 Windows 原生注册表策略，不联网、不加驱、不驻留          │
 │                                                                     │
-│   🔗 完整报告：https://www.virustotal.com/gui/file/1d1303599...     │
+│   🔗 完整报告：https://www.virustotal.com/gui/file/1d130359917d92aba83e56737b2c88488dd0471b2926163d715408bdfbe957f0 │
 │                                                                     │
-│   ⚠️  下载前请临时关闭 Windows Defender 实时防护                    │
-│   ⚠️  或将下载目录加入杀毒软件排除列表                              │
-│   ⚠️  下载完成后可重新开启防护                                      │
+│   ⚠️  如果下载被拦截，建议将下载目录加入杀毒软件排除列表            │
+│   ⚠️  或临时暂停实时防护，下载完成后即可恢复                          │
+│   ⚠️  操作主动权在你手里，信任来自你对源码的审计                      │
 │                                                                     │
 └─────────────────────────────────────────────────────────────────────┘
 ```
@@ -41,7 +41,7 @@
 |--------------------------|-------------------|
 | 源码公开，MIT 协议，人人可审计 | PyInstaller 单文件 exe 行为像 dropper（解压到 %TEMP%、启动子进程） |
 | 只写注册表，不做任何联网操作 | 无数字签名（个人开发者无法负担每年 $300+ 的代码签名证书） |
-| 调用的全部是 Windows 公开 API（winreg / gpupdate） | 小众工具，杀毒引擎没有白名单收录 |
+| 调用的全部是 Windows 公开 API（ctypes → advapi32 / kernel32） | ctypes 调用 RegSetValueEx 等注册表 API 的行为模式与恶意软件相似，触发启发式检测 |
 | VirusTotal 8/70 检出均为 dropper/generic 行为特征，**零恶意代码检出** | 62/70 引擎判定安全，包括 Microsoft、Kaspersky 等一线厂商 |
 
 ---
@@ -285,7 +285,7 @@ python -m PyInstaller certlock.spec
 |------|------|------|
 | **语言** | Python 3.6+ | 无第三方运行时依赖 |
 | **GUI** | tkinter / ttk | Windows 系统内置，无需额外安装 |
-| **核心逻辑** | winreg | Python 标准库，直接操作注册表 |
+| **核心逻辑** | ctypes + advapi32 | 直接调用 Windows 原生注册表 API（RegCreateKeyEx / RegSetValueEx） |
 | **证书提取** | 纯 Python ASN.1 DER 解析器 | 不依赖 PowerShell / OpenSSL / .NET |
 | **策略刷新** | gpupdate | Windows 原生命令，立即更新策略 |
 | **打包** | PyInstaller | 单文件封装，内置 Python 解释器 |
