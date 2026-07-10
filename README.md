@@ -3,7 +3,7 @@
 > **Windows 证书封禁工具 — 永久阻止流氓软件运行**  
 > 单文件 · 便携 · 无残留 · ZyperWin++ 风格
 
-![Version](https://img.shields.io/badge/version-1.6.0-blue)
+![Version](https://img.shields.io/badge/version-1.7.0-blue)
 ![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-lightgrey)
 ![License](https://img.shields.io/badge/license-MIT-green)
 ![Python](https://img.shields.io/badge/python-3.6%2B-yellow)
@@ -90,12 +90,13 @@ CertLock 是一款轻量级 Windows 安全工具，通过调用系统原生的 *
 | 🔌 **单文件便携** | 一个 `CertLock.exe` (~8 MB)，无需安装，U 盘带走即用 |
 | ⚡ **一键封禁** | 拖入任意签名 .exe → 自动提取证书 → 一键写入策略 |
 | 🔒 **哈希封禁** | 支持无数字签名软件的 SHA256 哈希封禁 |
+| 🔓 **路径白名单** | 证书封禁后，按文件路径单独放行特定 .exe |
 | 🛡️ **系统目录保护** | 自动阻止封禁 `C:\Windows` 等系统路径，防止误操作 |
 | 💻 **命令行模式** | 支持 CLI 操作：`--block` / `--hash` / `--list` / `--remove` 等 |
 | 📊 **结构化输出** | `--list --json` / `--csv` 脚本友好输出，退出码标准化 |
 | 🔍 **试运行模式** | `--dry-run` 预览封禁影响，不实际写入策略 |
 | 📦 **6 大预设** | 内置 360、金山、鲁大师、腾讯、2345 等已知流氓软件证书 |
-| 👁️ **可视化列表** | 证书/哈希规则双视图，一键切换，过期证书自动标记 ⚠ |
+| 👁️ **可视化列表** | 证书 / 哈希 / 路径白名单三视图，一键轮换，过期证书自动标记 ⚠ |
 | 🗑️ **一键解封** | 选中 → 移除，恢复该厂商软件运行权限 |
 | ↩️ **操作历史** | 记录最近 20 步操作，支持一键撤销（含重启提醒） |
 | 🌗 **暗色模式** | 自动跟随 Windows 系统主题（浅色/深色）切换 |
@@ -107,7 +108,7 @@ CertLock 是一款轻量级 Windows 安全工具，通过调用系统原生的 *
 | 📜 **Windows 事件日志** | 关键操作（封禁/解封/撤销）写入系统审计日志 |
 | ⚖️ **策略冲突检测** | 启动时检测非 CertLock 创建的 SRP 规则，提示覆盖风险 |
 | 🧹 **零残留** | 仅写入 Windows 原生注册表策略，不安装驱动/服务/后台进程 |
-| 🔓 **开源透明** | 100% Python 源码，MIT 协议，可自行审计或二次开发 |
+| 🔓 **路径白名单** | 证书规则封禁后，单独放行特定 .exe — SRP 原生 Path Rules 机制 |
 | 🛡️ **系统级生效** | 内核加载器强制执行，无法被应用层绕过 |
 | 💤 **无后台运行** | 策略写入后工具即可关闭，无需常驻 |
 
@@ -117,7 +118,7 @@ CertLock 是一款轻量级 Windows 安全工具，通过调用系统原生的 *
 
 ### 方式 1：下载 .exe（推荐）
 
-[**⬇️ 下载 CertLock_v1.6.0.zip**](https://github.com/zhaofeiy2002-ctrl/certlock/raw/master/CertLock_v1.6.0.zip)（~11 MB）
+[**⬇️ 下载 CertLock_v1.7.0.zip**](https://github.com/zhaofeiy2002-ctrl/certlock/raw/master/CertLock_v1.7.0.zip)（~11 MB）
 
 解压后 **右键 `CertLock.exe` → 以管理员身份运行**，即刻使用。
 
@@ -152,6 +153,7 @@ build.bat
 | 封禁任意厂商 | 「➕ 封禁新证书」→ 选择该厂商 .exe | ✅ 该厂商所有软件被阻止 |
 | 查看已封禁 | 主界面列表自动加载（过期证书标 ⚠） | — |
 | 解封某厂商 | 选中 → 「✖ 移除选中」→ 确认 | ✅ 恢复运行 |
+| 路径白名单 | 「🔓 添加白名单路径」→ 选择 .exe | ✅ 该程序不受证书规则限制 |
 | 备份证书 | 选中 → 「📋 导出证书」→ 保存为 .cer | — |
 | 封禁无签名软件 | 「🔒 封禁文件(哈希)」→ 选择文件 | ✅ 该精确文件被阻止 |
 | 预览影响 | CLI: `certlock --dry-run --block app.exe` | — |
@@ -214,12 +216,24 @@ certlock
 
 ---
 
+## 🔓 路径白名单（v1.7.0 新增）
+
+Windows SRP 支持三级规则，优先级为 **路径 > 证书 > 哈希**。CertLock v1.7.0 充分利用了这一机制：
+
+> **典型场景**：你一键封了金山的所有证书签名软件，但 WPS 确实需要正常使用。此时给 `wps.exe` 加一条路径白名单，它就能在证书封禁下照常运行——其他金山系软件（驱动精灵、金山毒霸等）依然被封。
+
+**如何使用**：点击「查看哈希规则」→ 再点一次切到「查看路径白名单」→「🔓 添加白名单路径」选择 .exe 即可。
+
+> ⚠️ 路径白名单是 SRP 原生的 Path Rules (Unrestricted) 机制，不是 CertLock 自己实现的功能。白名单规则写的是精确文件路径，不支持通配符。
+
+---
+
 ## 📸 截图
 
 | 界面 | 说明 |
 |------|------|
 | ![主界面](docs/screenshot_main.png) | 证书规则列表 + 快速预设面板 + 操作按钮 |
-| 证书列表 | 显示指纹（SHA1）、厂商描述、封禁状态 |
+| 路径白名单视图 | 三向视图切换（证书→哈希→路径），添加/移除路径白名单 |
 | 封禁操作 | 选择签名文件 → 确认厂商信息 → 一键写入 |
 | 预设面板 | 6 个内置厂商，一键封禁，绿色标识表示已嵌入证书 |
 
@@ -302,13 +316,29 @@ HKLM\SOFTWARE\Policies\Microsoft\Windows\Safer\CodeIdentifiers
 ├── PolicyScope            = 0          (REG_DWORD: 应用于所有用户)
 ├── authenticodeenabled    = 1          (REG_DWORD: 强制启用证书规则)
 │
-└── 0\Certificates\
-    ├── {指纹1}\
-    │   ├── ItemData       = <Base64 DER 证书>
-    │   ├── SaferFlags     = 0          (0 = 不允许, 1 = 允许)
-    │   └── Description    = "Block all software signed by ..."
-    │
-    └── {指纹2}\ ...
+├── 0\Certificates\
+│   ├── {指纹1}\
+│   │   ├── ItemData       = <Base64 DER 证书>
+│   │   ├── SaferFlags     = 0          (0 = 不允许)
+│   │   └── Description    = "Block all software signed by ..."
+│   │
+│   └── {指纹2}\ ...
+│
+├── 0\Hashes\
+│   └── {GUID}\
+│       ├── ItemData       = <SHA256 哈希>
+│       ├── SaferFlags     = 0
+│       └── Description    = "Block file by hash: ..."
+│
+└── 0\Paths\
+    └── {GUID}\
+        ├── ItemData       = "C:\Path\To\App.exe"  (REG_SZ)
+        ├── SaferFlags     = 0x40000   (Unrestricted = 白名单)
+        ├── ItemSize       = 0x20000
+        └── Description    = "Whitelist: ..."
+```
+
+> **优先级**：Path Rules > Certificate Rules > Hash Rules。路径白名单设置后，即使该程序被证书规则封禁，也能正常运行。
 ```
 
 ### 证书提取流程
@@ -375,7 +405,7 @@ PE 文件
 - [x] **导出脱敏** — 模板导出自动剔除本地路径/用户名 ✅ v1.6.0
 - [x] **批量操作确认** — ≥20 条规则导入强制二次确认 ✅ v1.6.0
 - [x] **社区治理** — CONTRIBUTING.md 贡献指南 ✅ v1.6.0
-- [ ] **路径规则封禁** — 按文件路径阻止运行
+- [x] **路径白名单** — 证书封禁后按文件路径单独放行 ✅ v1.7.0
 - [ ] **模板仓库独立化** — 社区模板拆分到独立仓库 + CI 校验
 - [ ] **模板签名验证** — RSA/ECDSA 签名或 SHA256 校验和
 - [ ] **多语言支持** — EN / zh-CN
