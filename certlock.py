@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-CertLock v1.6.0 — Windows Certificate/Hash Blocker
+CertLock v1.7.0 — Windows Certificate/Hash Blocker
 =============================================
 A lightweight GUI tool to block unwanted software via Windows
-Software Restriction Policy (SRP) certificate & hash rules.
+Software Restriction Policy (SRP) certificate & hash rules,
+with path whitelist support to exempt specific programs.
 
-Features: cert/hash blocking, 6 presets, dark mode, CLI mode,
+Features: cert/hash/path rules, 6 presets, dark mode, CLI mode,
           restart banner, impact preview, policy backup/restore,
           operation history, community template import/export,
           system path protection, certificate expiry warnings,
@@ -27,6 +28,7 @@ import ctypes
 import hashlib
 import base64
 import struct
+import uuid
 import argparse
 import winreg
 import subprocess
@@ -38,10 +40,12 @@ from tkinter import ttk, messagebox, filedialog
 # Constants
 # ============================================================
 APP_NAME    = "CertLock"
-APP_VERSION = "1.6.0"
+APP_VERSION = "1.7.0"
 SRP_ROOT    = r"SOFTWARE\Policies\Microsoft\Windows\Safer\CodeIdentifiers"
 CERT_RULES  = SRP_ROOT + "\\0\\Certificates"
 HASH_RULES  = SRP_ROOT + "\\0\\Hashes"
+PATH_RULES  = SRP_ROOT + "\\0\\Paths"
+SAFER_LEVELID_UNRESTRICTED = 0x40000
 
 # System directories protected from hash blocking
 SYSTEM_PATHS = [
@@ -650,8 +654,135 @@ def reg_remove_hash(sha256):
 
 
 # ============================================================
-# Community Template (JSON-based shared blocklist)
+# Path Rule Operations (whitelist — override cert/hash blocks)
 # ============================================================
+def reg_list_paths():
+    """List all Path rules. Returns list of dicts (guid, path, description, unrestricted)."""
+    results = []
+    srp = paths_key = None
+    try:
+        srp = reg_open_srp("r")
+        if srp is None:
+            return results
+        try:
+            paths_key = winreg.OpenKey(
+                winreg.HKEY_LOCAL_MACHINE, PATH_RULES, 0, winreg.KEY_READ
+            )
+        except FileNotFoundError:
+            return results
+
+        idx = 0
+        while True:
+            try:
+                guid = winreg.EnumKey(paths_key, idx)
+                rule = winreg.OpenKey(
+                    winreg.HKEY_LOCAL_MACHINE,
+                    f"{PATH_RULES}\\{guid}", 0, winreg.KEY_READ
+                )
+                try:
+                    desc, _ = winreg.QueryValueEx(rule, "Description")
+                except FileNotFoundError:
+                    desc = "(no description)"
+                try:
+                    flags, _ = winreg.QueryValueEx(rule, "SaferFlags")
+                except FileNotFoundError:
+                    flags = 0
+                try:
+                    item_data, _ = winreg.QueryValueEx(rule, "ItemData")
+                except FileNotFoundError:
+                    item_data = ""
+
+                results.append({
+                    "guid": guid,
+                    "path": item_data,
+                    "description": desc,
+                    "unrestricted": (flags == SAFER_LEVELID_UNRESTRICTED),
+                })
+                winreg.CloseKey(rule)
+                idx += 1
+            except OSError:
+                break
+    except Exception as e:
+        print(f"[CertLock] reg_list_paths failed: {e}", file=sys.stderr)
+    finally:
+        if paths_key:
+            winreg.CloseKey(paths_key)
+        if srp:
+            winreg.CloseKey(srp)
+    return results
+
+
+def reg_add_path_rule(filepath, description):
+    """Add a Path rule (Unrestricted) to whitelist a specific program.
+    Path rules take precedence over certificate/hash rules in SRP.
+    Returns (success: bool, guid: str)."""
+    rule = None
+    guid = "{" + str(uuid.uuid4()).upper() + "}"
+    try:
+        # Ensure Paths container exists
+        try:
+            h = winreg.OpenKey(
+                winreg.HKEY_LOCAL_MACHINE, PATH_RULES, 0, winreg.KEY_ALL_ACCESS
+            )
+            winreg.CloseKey(h)
+        except FileNotFoundError:
+            winreg.CreateKey(winreg.HKEY_LOCAL_MACHINE, PATH_RULES)
+
+        # Create rule key
+        rule = winreg.CreateKey(
+            winreg.HKEY_LOCAL_MACHINE, f"{PATH_RULES}\\{guid}"
+        )
+        winreg.SetValueEx(rule, "ItemData", 0, winreg.REG_SZ, filepath)
+        winreg.SetValueEx(rule, "SaferFlags", 0, winreg.REG_DWORD,
+                          SAFER_LEVELID_UNRESTRICTED)
+        winreg.SetValueEx(rule, "ItemSize", 0, winreg.REG_DWORD, 0x20000)
+        winreg.SetValueEx(rule, "Description", 0, winreg.REG_SZ, description)
+
+        # Refresh policy
+        subprocess.run(["gpupdate", "/target:computer", "/force"],
+                       capture_output=True, timeout=30)
+        return True, guid
+    except Exception:
+        return False, ""
+    finally:
+        if rule:
+            winreg.CloseKey(rule)
+
+
+def reg_remove_path(guid):
+    """Remove a Path rule by its GUID. Returns True on success."""
+    rule = parent = None
+    try:
+        rule_path = f"{PATH_RULES}\\{guid}"
+        # Delete values first, then key
+        try:
+            rule = winreg.OpenKey(
+                winreg.HKEY_LOCAL_MACHINE, rule_path, 0,
+                winreg.KEY_ALL_ACCESS | winreg.KEY_WOW64_64KEY
+            )
+            for name in ("ItemData", "SaferFlags", "ItemSize", "Description"):
+                try:
+                    winreg.DeleteValue(rule, name)
+                except FileNotFoundError:
+                    pass
+        except FileNotFoundError:
+            pass
+
+        parent = winreg.OpenKey(
+            winreg.HKEY_LOCAL_MACHINE, PATH_RULES, 0,
+            winreg.KEY_ALL_ACCESS | winreg.KEY_WOW64_64KEY
+        )
+        winreg.DeleteKey(parent, guid)
+
+        subprocess.run(["gpupdate", "/target:computer", "/force"],
+                       capture_output=True, timeout=30)
+        return True
+    except Exception:
+        return False
+    finally:
+        for h in (rule, parent):
+            if h:
+                winreg.CloseKey(h)
 def export_community_template(filepath, selected_entries):
     """Export selected cert/hash rules as a community template JSON.
     selected_entries: list of {type:'cert'|'hash', thumbprint/hash, description, cert_data/hash_data}
@@ -1125,8 +1256,8 @@ class CertLockApp:
         # Operation history (max 20 entries)
         self.history = deque(maxlen=20)
 
-        # View toggle: cert or hash rules
-        self.show_hashes = False
+        # View toggle: cert, hash, or path rules
+        self.view_mode = "cert"  # "cert" | "hash" | "path"
 
         # Policy conflicts detected at startup
         self.policy_conflicts = policy_conflicts or []
@@ -1239,7 +1370,7 @@ class CertLockApp:
         ).pack(anchor=tk.W)
         ttk.Label(
             title_frame,
-            text="Windows 证书封禁工具 — 永久阻止流氓软件运行 | 单文件 · 便携 · 无残留",
+            text="Windows 证书/哈希封禁 + 路径白名单 | 单文件 · 便携 · 无残留",
             style="Subtitle.TLabel"
         ).pack(anchor=tk.W)
 
@@ -1308,6 +1439,12 @@ class CertLockApp:
             command=self.on_block_hash, width=18
         )
         # Hidden until hash view is active
+
+        self.btn_path_whitelist = ttk.Button(
+            btn_row1, text="🔓 添加白名单路径",
+            command=self.on_add_path_whitelist, width=18
+        )
+        # Hidden until path view is active
 
         self.btn_remove = ttk.Button(
             btn_row1, text="✖ 移除选中",
@@ -2179,20 +2316,30 @@ class CertLockApp:
     # Hash Rule UI
     # ============================================================
     def on_toggle_view(self):
-        """Toggle between certificate and hash rule views."""
-        self.show_hashes = not self.show_hashes
-        if self.show_hashes:
-            self.list_title.config(text="已封禁哈希列表")
-            self.btn_toggle_view.config(text="查看证书规则")
-            self.btn_block.pack_forget()
-            self.btn_block_hash.pack(side=tk.LEFT, padx=(0, 4), before=self.btn_remove)
-            self.btn_export.pack_forget()
-        else:
+        """Cycle between certificate / hash / path rule views."""
+        # Cycle: cert → hash → path → cert
+        cycle = {"cert": "hash", "hash": "path", "path": "cert"}
+        self.view_mode = cycle[self.view_mode]
+
+        # Hide all mode-specific action buttons
+        for btn in (self.btn_block, self.btn_block_hash, self.btn_path_whitelist):
+            btn.pack_forget()
+        self.btn_export.pack_forget()
+
+        if self.view_mode == "cert":
             self.list_title.config(text="已封禁证书列表")
             self.btn_toggle_view.config(text="查看哈希规则")
-            self.btn_block_hash.pack_forget()
             self.btn_block.pack(side=tk.LEFT, padx=(0, 4), before=self.btn_remove)
             self.btn_export.pack(side=tk.RIGHT, padx=(4, 0))
+        elif self.view_mode == "hash":
+            self.list_title.config(text="已封禁哈希列表")
+            self.btn_toggle_view.config(text="查看路径白名单")
+            self.btn_block_hash.pack(side=tk.LEFT, padx=(0, 4), before=self.btn_remove)
+        else:  # path
+            self.list_title.config(text="路径白名单列表")
+            self.btn_toggle_view.config(text="查看证书规则")
+            self.btn_path_whitelist.pack(side=tk.LEFT, padx=(0, 4), before=self.btn_remove)
+
         self.refresh_list()
 
     def on_block_hash(self):
@@ -2266,6 +2413,75 @@ class CertLockApp:
         else:
             messagebox.showerror("封禁失败", "写入注册表失败。请以管理员身份运行。")
             self.status_label.config(text="封禁失败 — 请检查管理员权限")
+
+        self.refresh_list()
+
+    # ============================================================
+    # Path Whitelist UI
+    # ============================================================
+    def on_add_path_whitelist(self):
+        """Add a path rule (Unrestricted) to whitelist a specific program
+        so it can run despite a certificate/hash block."""
+        filepath = filedialog.askopenfilename(
+            title="选择要加入白名单的程序 (.exe)",
+            filetypes=[
+                ("可执行文件", "*.exe;*.dll;*.msi"),
+                ("所有文件", "*.*"),
+            ]
+        )
+        if not filepath:
+            return
+
+        fname = os.path.basename(filepath)
+        fdir = os.path.dirname(filepath)
+
+        # Safety: warn if path looks too broad
+        is_sys, sys_path = is_system_path(filepath)
+        if is_sys:
+            if not messagebox.askyesno(
+                "系统目录警告",
+                f"该文件位于系统目录：\n\n"
+                f"  {sys_path}\n\n"
+                f"将系统文件加入白名单可能降低安全性。\n"
+                f"建议仅对第三方软件目录使用白名单。\n\n"
+                f"确定继续？"
+            ):
+                self.status_label.config(text="已取消")
+                return
+
+        confirm = messagebox.askyesno(
+            "确认添加路径白名单",
+            f"即将为以下程序添加路径白名单：\n\n"
+            f"  文件: {fname}\n"
+            f"  路径: {filepath}\n\n"
+            f"该程序将不受证书/哈希封禁策略限制。\n"
+            f"⚠ 路径规则优先级高于证书和哈希规则。\n\n"
+            f"确定添加？"
+        )
+        if not confirm:
+            self.status_label.config(text="已取消")
+            return
+
+        desc = f"Whitelist: {fname} (override cert/hash block)"
+        success, guid = reg_add_path_rule(filepath, desc)
+
+        if success:
+            messagebox.showinfo(
+                "白名单添加成功",
+                f"路径规则已写入！\n\n"
+                f"  文件: {fname}\n"
+                f"  路径: {filepath}\n\n"
+                f"该程序将被排除在证书封禁策略之外。"
+            )
+            self.status_label.config(text=f"已添加白名单: {fname}")
+            self._add_history("path_whitelist", guid, fname)
+            write_event_log(
+                f"Added path whitelist: {filepath} ({guid[:16]}...)",
+                1004, "WARNING"
+            )
+        else:
+            messagebox.showerror("添加失败", "写入注册表失败。请以管理员身份运行本程序。")
+            self.status_label.config(text="白名单添加失败 — 请检查管理员权限")
 
         self.refresh_list()
 
@@ -2465,6 +2681,8 @@ class CertLockApp:
             'cert_remove': '🔓 证书解封',
             'hash_block': '🔒 哈希封禁',
             'hash_remove': '🔓 哈希解封',
+            'path_whitelist': '🔓 路径白名单',
+            'path_remove': '🔒 移除白名单',
             'template_import': '📥 模板导入',
         }
         for entry in reversed(list(self.history)):
@@ -2537,6 +2755,21 @@ class CertLockApp:
                     self._add_history("hash_remove", rule_id, "撤销封禁")
                 else:
                     messagebox.showerror("撤销失败", "无法移除该规则。")
+        elif action == 'path_whitelist':
+            confirm = messagebox.askyesno(
+                "撤销白名单",
+                f"将移除刚添加的路径白名单：\n"
+                f"  描述: {last.get('description', rule_id)}\n\n"
+                f"⚠ 撤销后该程序将重新受证书封禁策略限制。\n\n"
+                f"确定撤销？"
+            )
+            if confirm:
+                if reg_remove_path(rule_id):
+                    self.status_label.config(text="已撤销: 路径白名单 | 重启后生效")
+                    write_event_log(f"Undone path whitelist: {rule_id[:16]}...", 1005, "WARNING")
+                    self._add_history("path_remove", rule_id, "撤销白名单")
+                else:
+                    messagebox.showerror("撤销失败", "无法移除该规则。")
         elif action == 'cert_remove':
             messagebox.showinfo("提示", "解封操作不支持撤销。请通过「封禁新证书」重新封禁。")
             return
@@ -2553,11 +2786,11 @@ class CertLockApp:
     # Override: refresh_list with hash support
     # ============================================================
     def refresh_list(self):
-        """Refresh the list from registry (certs or hashes depending on view)."""
+        """Refresh the list from registry (certs, hashes, or paths depending on view)."""
         for item in self.tree.get_children():
             self.tree.delete(item)
 
-        if self.show_hashes:
+        if self.view_mode == "hash":
             # Hash view
             rules = reg_list_hashes()
             self.tree.heading("thumbprint", text="SHA256 哈希")
@@ -2576,6 +2809,29 @@ class CertLockApp:
                         r['hash'], r['description'], status_text
                     ))
                 self.status_label.config(text=f"共 {len(rules)} 个哈希规则 | 重启后完全生效")
+        elif self.view_mode == "path":
+            # Path whitelist view
+            rules = reg_list_paths()
+            self.tree.heading("thumbprint", text="文件路径")
+            self.tree.heading("description", text="描述")
+            self.tree.heading("status", text="状态")
+            self.tree.column("thumbprint", width=420, minwidth=250)
+            if not rules:
+                self.tree.insert("", tk.END, values=(
+                    "(空)", "尚未添加任何路径白名单", ""
+                ))
+                self.status_label.config(text="未检测到路径白名单")
+            else:
+                for r in rules:
+                    status_text = "白名单 ✓" if r['unrestricted'] else "已阻止"
+                    # iid = GUID for easy removal lookup
+                    self.tree.insert("", tk.END, iid=r['guid'], values=(
+                        r['path'], r['description'], status_text
+                    ))
+                whitelist_count = sum(1 for r in rules if r['unrestricted'])
+                self.status_label.config(
+                    text=f"共 {len(rules)} 条路径规则 | {whitelist_count} 条白名单"
+                )
         else:
             # Cert view (original)
             certs = reg_list_certs()
@@ -2630,7 +2886,8 @@ class CertLockApp:
         # Show/hide restart warning banner
         certs = reg_list_certs()
         hashes = reg_list_hashes()
-        if certs or hashes:
+        paths = reg_list_paths()
+        if certs or hashes or paths:
             self.restart_banner.pack(
                 fill=tk.X, side=tk.BOTTOM,
                 before=self._status_separator
@@ -2649,42 +2906,59 @@ class CertLockApp:
             self.certdata_banner.pack_forget()
 
         # Update preset button states (only in cert view)
-        if not self.show_hashes:
+        if self.view_mode == "cert":
             self._update_preset_states()
 
     # ============================================================
     # Override: on_remove with hash support
     # ============================================================
     def on_remove(self):
-        """Remove the selected rule (cert or hash)."""
+        """Remove the selected rule (cert, hash, or path)."""
         selection = self.tree.selection()
         if not selection:
             messagebox.showinfo("提示", "请先在列表中选择要移除的规则。")
             return
 
         item = self.tree.item(selection[0])
-        rule_id = item['values'][0]
+        # For path view, rule_id = GUID (stored as iid); for cert/hash, rule_id = values[0]
+        if self.view_mode == "path":
+            rule_id = selection[0]  # iid = GUID
+        else:
+            rule_id = item['values'][0]
         description = item['values'][1]
 
         if rule_id == "(空)":
             return
 
-        rule_type = "哈希" if self.show_hashes else "证书"
-        confirm = messagebox.askyesno(
-            "确认移除",
-            f"确定要移除以下{rule_type}封禁规则？\n\n"
-            f"  ID: {rule_id[:40]}...\n"
-            f"  描述: {description}\n\n"
-            f"移除后，该规则将不再阻止软件运行。"
-        )
+        rule_type = {"cert": "证书", "hash": "哈希", "path": "路径"}[self.view_mode]
+        if self.view_mode == "path":
+            confirm_msg = (
+                f"确定要移除以下{rule_type}白名单规则？\n\n"
+                f"  路径: {item['values'][0]}\n"
+                f"  描述: {description}\n\n"
+                f"移除后，该程序将重新受证书封禁策略限制。"
+            )
+        else:
+            confirm_msg = (
+                f"确定要移除以下{rule_type}封禁规则？\n\n"
+                f"  ID: {rule_id[:40]}...\n"
+                f"  描述: {description}\n\n"
+                f"移除后，该规则将不再阻止软件运行。"
+            )
+        confirm = messagebox.askyesno("确认移除", confirm_msg)
         if not confirm:
             return
 
-        if self.show_hashes:
+        if self.view_mode == "hash":
             success = reg_remove_hash(rule_id)
             if success:
                 self._add_history("hash_remove", rule_id, description)
                 write_event_log(f"Removed hash rule: {rule_id[:16]}...", 1003, "WARNING")
+        elif self.view_mode == "path":
+            success = reg_remove_path(rule_id)
+            if success:
+                self._add_history("path_remove", rule_id, description)
+                write_event_log(f"Removed path whitelist: {item['values'][0]}", 1005, "WARNING")
         else:
             success = reg_remove_cert(rule_id)
             if success:
