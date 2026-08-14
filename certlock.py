@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-CertLock v1.7.0 — Windows Certificate/Hash Blocker
+CertLock v1.7.1 — Windows Certificate/Hash Blocker
 =============================================
 A lightweight GUI tool to block unwanted software via Windows
 Software Restriction Policy (SRP) certificate & hash rules,
@@ -28,6 +28,7 @@ import ctypes
 import hashlib
 import base64
 import struct
+import tempfile
 import uuid
 import argparse
 import winreg
@@ -40,7 +41,7 @@ from tkinter import ttk, messagebox, filedialog
 # Constants
 # ============================================================
 APP_NAME    = "CertLock"
-APP_VERSION = "1.7.0"
+APP_VERSION = "1.7.1"
 SRP_ROOT    = r"SOFTWARE\Policies\Microsoft\Windows\Safer\CodeIdentifiers"
 CERT_RULES  = SRP_ROOT + "\\0\\Certificates"
 HASH_RULES  = SRP_ROOT + "\\0\\Hashes"
@@ -265,7 +266,7 @@ def reg_open_srp(mode="r"):
         if mode == "r":
             return None
         key = winreg.CreateKey(winreg.HKEY_LOCAL_MACHINE, SRP_ROOT)
-        winreg.SetValueEx(key, "DefaultLevel", 0, winreg.REG_DWORD, 0)
+        winreg.SetValueEx(key, "DefaultLevel", 0, winreg.REG_DWORD, SAFER_LEVELID_UNRESTRICTED)
         winreg.SetValueEx(key, "PolicyScope", 0, winreg.REG_DWORD, 0)
         winreg.SetValueEx(key, "authenticodeenabled", 0, winreg.REG_DWORD, 1)
         return key
@@ -330,6 +331,30 @@ def reg_list_certs():
     return results
 
 
+def _import_to_trusted_publishers(raw_cert):
+    """Import a DER cert into the machine's Trusted Publisher store.
+
+    SRP certificate rules only match software whose signing certificate is
+    present in Trusted Publishers. Returns True on success.
+    """
+    tmp = os.path.join(tempfile.gettempdir(), "certlock_" + uuid.uuid4().hex + ".cer")
+    try:
+        with open(tmp, "wb") as f:
+            f.write(raw_cert)
+        r = subprocess.run(
+            ["certutil", "-addstore", "-f", "TrustedPublisher", tmp],
+            capture_output=True, timeout=30
+        )
+        return r.returncode == 0
+    except Exception:
+        return False
+    finally:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+
+
 def reg_add_cert(thumbprint, cert_blob_b64, description):
     """Add a certificate rule to block. Returns True on success."""
     srp = certs = rule = None
@@ -347,9 +372,11 @@ def reg_add_cert(thumbprint, cert_blob_b64, description):
         rule = winreg.CreateKey(
             winreg.HKEY_LOCAL_MACHINE, f"{CERT_RULES}\\{thumbprint}"
         )
-        winreg.SetValueEx(rule, "ItemData", 0, winreg.REG_SZ, cert_blob_b64)
+        raw_cert = base64.b64decode(cert_blob_b64)
+        winreg.SetValueEx(rule, "ItemData", 0, winreg.REG_BINARY, raw_cert)
         winreg.SetValueEx(rule, "SaferFlags", 0, winreg.REG_DWORD, 0)
         winreg.SetValueEx(rule, "Description", 0, winreg.REG_SZ, description)
+        _import_to_trusted_publishers(raw_cert)
 
         # Refresh group policy
         subprocess.run(
@@ -363,6 +390,54 @@ def reg_add_cert(thumbprint, cert_blob_b64, description):
         for h in (rule, certs, srp):
             if h:
                 winreg.CloseKey(h)
+
+
+def repair_legacy_rules():
+    """Migrate v1.6.0 rules written with wrong registry value types.
+
+    v1.6.0 wrote certificate ItemData as REG_SZ (base64 text); SRP ignores a
+    cert rule whose ItemData isn't a raw DER blob, so nothing was blocked.
+    It could also leave DefaultLevel=0 (Disallowed), which blocks *every*
+    program. Rewrite cert rules as REG_BINARY and reset DefaultLevel to
+    Unrestricted. Idempotent; returns number of rules repaired.
+    """
+    fixed = 0
+    try:
+        srp = reg_open_srp("w")
+        if srp is not None:
+            try:
+                level, _ = winreg.QueryValueEx(srp, "DefaultLevel")
+                if level == 0:
+                    winreg.SetValueEx(
+                        srp, "DefaultLevel", 0, winreg.REG_DWORD,
+                        SAFER_LEVELID_UNRESTRICTED
+                    )
+                    fixed += 1
+            except FileNotFoundError:
+                pass
+            winreg.CloseKey(srp)
+    except Exception:
+        pass
+
+    # REG_SZ (str) = legacy base64; REG_BINARY (bytes) is already correct.
+    for rule in reg_list_certs():
+        data = rule.get("cert_data")
+        thumbprint = rule.get("thumbprint")
+        if not isinstance(data, str) or not thumbprint:
+            continue
+        try:
+            raw = base64.b64decode(data)
+            key = winreg.OpenKey(
+                winreg.HKEY_LOCAL_MACHINE, f"{CERT_RULES}\\{thumbprint}",
+                0, winreg.KEY_ALL_ACCESS
+            )
+            winreg.SetValueEx(key, "ItemData", 0, winreg.REG_BINARY, raw)
+            winreg.CloseKey(key)
+            _import_to_trusted_publishers(raw)
+            fixed += 1
+        except Exception:
+            continue
+    return fixed
 
 
 def reg_remove_cert(thumbprint):
@@ -3321,6 +3396,7 @@ def main():
             print("需要管理员权限。请右键 → 以管理员身份运行。")
             sys.exit(EXIT_NEED_ADMIN)
         load_preset_cert_data()
+        repair_legacy_rules()
         _run_cli(args)
         return
 
@@ -3330,6 +3406,7 @@ def main():
         sys.exit(EXIT_SUCCESS)
 
     load_preset_cert_data()
+    repair_legacy_rules()
 
     # Check for policy conflicts on startup
     conflicts = check_policy_conflicts()
