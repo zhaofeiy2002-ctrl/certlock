@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-CertLock v1.7.1 — Windows Certificate/Hash Blocker
+CertLock v1.7.2 — Windows Certificate/Hash Blocker
 =============================================
 A lightweight GUI tool to block unwanted software via Windows
 Software Restriction Policy (SRP) certificate & hash rules,
@@ -41,7 +41,7 @@ from tkinter import ttk, messagebox, filedialog
 # Constants
 # ============================================================
 APP_NAME    = "CertLock"
-APP_VERSION = "1.7.1"
+APP_VERSION = "1.7.2"
 SRP_ROOT    = r"SOFTWARE\Policies\Microsoft\Windows\Safer\CodeIdentifiers"
 CERT_RULES  = SRP_ROOT + "\\0\\Certificates"
 HASH_RULES  = SRP_ROOT + "\\0\\Hashes"
@@ -259,9 +259,14 @@ def reg_open_srp(mode="r"):
     """Open the SRP CodeIdentifiers key. Create if writing."""
     access = winreg.KEY_READ if mode == "r" else winreg.KEY_ALL_ACCESS
     try:
-        return winreg.OpenKey(
+        key = winreg.OpenKey(
             winreg.HKEY_LOCAL_MACHINE, SRP_ROOT, 0, access
         )
+        if mode == "w":
+            # SRP ignores certificate rules when this switch is off; ensure
+            # it on every write, not just when the key is first created.
+            winreg.SetValueEx(key, "authenticodeenabled", 0, winreg.REG_DWORD, 1)
+        return key
     except FileNotFoundError:
         if mode == "r":
             return None
