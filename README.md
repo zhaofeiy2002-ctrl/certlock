@@ -8,7 +8,20 @@
 
 CertLock 为选定的代码签名证书写入 Windows 软件限制策略（SRP）规则，并提供规则查看、移除、备份、导入和路径例外管理。它不安装驱动、服务或后台进程。
 
-## 下载
+## 工作方式
+
+```mermaid
+flowchart LR
+    file["已签名文件"] --> extract["提取签名证书"]
+    extract --> validate["校验 DER 与指纹"]
+    validate --> trust["导入 TrustedPublisher"]
+    trust --> rule["写入 SRP 证书规则"]
+    rule --> verify["注销或重启后验证"]
+```
+
+规则针对使用所选证书签名的文件。路径白名单可以为精确文件路径创建例外。
+
+## 开始使用
 
 [下载 CertLock v2.0.0](https://github.com/zhaofeiy2002-ctrl/certlock/releases/download/v2.0.0/CertLock_v2.0.0.zip)
 
@@ -26,7 +39,7 @@ CertLock 为选定的代码签名证书写入 Windows 软件限制策略（SRP�
 
 完整记录见 [CHANGELOG.md](CHANGELOG.md)，发布文件见 [v2.0.0 Release](https://github.com/zhaofeiy2002-ctrl/certlock/releases/tag/v2.0.0)。
 
-## 功能
+## 能做什么
 
 | 功能 | 说明 |
 | --- | --- |
@@ -37,7 +50,7 @@ CertLock 为选定的代码签名证书写入 Windows 软件限制策略（SRP�
 | 命令行 | 支持封禁、列出、移除、导入、导出与试运行。 |
 | 社区模板 | 导入和导出证书规则模板。 |
 
-## 使用前须知
+## 规则范围与注意事项
 
 - 规则针对**使用所选代码签名证书签名的文件**，不等同于自动覆盖某一厂商的所有软件。
 - 厂商更换签名证书后，旧规则不会覆盖使用新证书的文件；需要重新提取并添加该证书。
@@ -45,7 +58,7 @@ CertLock 为选定的代码签名证书写入 Windows 软件限制策略（SRP�
 - 添加、移除或还原规则后，请注销并重新登录，或重启计算机，再验证目标程序行为。
 - 请在隔离 Windows 环境中先验证规则，再用于日常工作环境。
 
-## 快速开始
+## 操作步骤
 
 1. 下载并解压 [v2.0.0 ZIP](https://github.com/zhaofeiy2002-ctrl/certlock/releases/download/v2.0.0/CertLock_v2.0.0.zip)。
 2. 右键 `CertLock.exe`，选择“以管理员身份运行”。
@@ -53,7 +66,7 @@ CertLock 为选定的代码签名证书写入 Windows 软件限制策略（SRP�
 4. 确认显示的证书信息后写入规则。
 5. 注销并重新登录或重启，再在隔离环境验证结果。
 
-## 命令行
+## 命令行使用
 
 ```powershell
 # 从已签名文件提取证书并写入规则
