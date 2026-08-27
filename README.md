@@ -1,9 +1,9 @@
 # 🔒 CertLock
 
-> **Windows 证书封禁工具 — 永久阻止流氓软件运行**  
+> **Windows 证书封禁工具**
 > 单文件 · 便携 · 无残留 · ZyperWin++ 风格
 
-![Version](https://img.shields.io/badge/version-1.7.2-blue)
+![Version](https://img.shields.io/badge/version-2.0.0-blue)
 ![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-lightgrey)
 ![License](https://img.shields.io/badge/license-MIT-green)
 ![Python](https://img.shields.io/badge/python-3.6%2B-yellow)
@@ -48,7 +48,7 @@
 
 ## 💡 这是什么？
 
-CertLock 是一款轻量级 Windows 安全工具，通过调用系统原生的 **软件限制策略 (Software Restriction Policy, SRP)**，以数字证书为粒度，**一劳永逸地阻止指定厂商签名的所有软件运行**。
+CertLock 通过 Windows 的 **软件限制策略 (Software Restriction Policy, SRP)**，为选定的代码签名证书写入禁止运行规则。
 
 ### 🤔 和删文件、卸载、改 Hosts 有何不同？
 
@@ -58,7 +58,7 @@ CertLock 是一款轻量级 Windows 安全工具，通过调用系统原生的 *
 | 删除文件 | ❌ 自修复/静默重下 | ❌ 随时被恢复 | 仅被删文件 |
 | 改 Hosts | ❌ 域名可换 | ⚠️ 换域名即绕过 | 仅网络层面 |
 | 杀毒拦截 | ⚠️ 占用资源 | ⚠️ 随软件卸载失效 | 依赖特征库 |
-| **CertLock** | ✅ **系统级阻断** | ✅ **永久生效** | ✅ **该厂商所有软件** |
+| **CertLock** | SRP 证书规则 | 策略保留至移除 | 使用该证书签名的文件 |
 
 ### ⚙️ 原理
 
@@ -89,7 +89,7 @@ CertLock 是一款轻量级 Windows 安全工具，通过调用系统原生的 *
 |------|------|
 | 🔌 **单文件便携** | 一个 `CertLock.exe` (~8 MB)，无需安装，U 盘带走即用 |
 | ⚡ **一键封禁** | 拖入任意签名 .exe → 自动提取证书 → 一键写入策略 |
-| 🔒 **哈希封禁** | 支持无数字签名软件的 SHA256 哈希封禁 |
+| 🔒 **哈希规则迁移** | v2 不再创建未经 Windows SRP 验证的哈希规则；可清理旧规则 |
 | 🔓 **路径白名单** | 证书封禁后，按文件路径单独放行特定 .exe |
 | 🛡️ **系统目录保护** | 自动阻止封禁 `C:\Windows` 等系统路径，防止误操作 |
 | 💻 **命令行模式** | 支持 CLI 操作：`--block` / `--hash` / `--list` / `--remove` 等 |
@@ -118,7 +118,7 @@ CertLock 是一款轻量级 Windows 安全工具，通过调用系统原生的 *
 
 ### 方式 1：下载 .exe（推荐）
 
-[**⬇️ 下载 CertLock_v1.7.2.zip**](https://github.com/zhaofeiy2002-ctrl/certlock/releases/download/v1.7.2/CertLock_v1.7.2.zip)（~11 MB）
+发布构建产物：`CertLock_v2.0.0.zip`。
 
 解压后 **右键 `CertLock.exe` → 以管理员身份运行**，即刻使用。
 
@@ -149,13 +149,12 @@ build.bat
 
 | 你想要 | 操作 | 重启后 |
 |--------|------|--------|
-| 封禁 360 全家桶 | 点击「✅ 360 (奇虎)」→ 确认 | ✅ 360 所有软件无法启动 |
-| 封禁任意厂商 | 「➕ 封禁新证书」→ 选择该厂商 .exe | ✅ 该厂商所有软件被阻止 |
+| 封禁内置证书 | 点击预设 → 确认 | 使用该证书签名的文件受规则限制 |
+| 封禁任意证书 | 「➕ 封禁新证书」→ 选择已签名文件 | 使用所选签名证书的文件受规则限制 |
 | 查看已封禁 | 主界面列表自动加载（过期证书标 ⚠） | — |
 | 解封某厂商 | 选中 → 「✖ 移除选中」→ 确认 | ✅ 恢复运行 |
 | 路径白名单 | 「🔓 添加白名单路径」→ 选择 .exe | ✅ 该程序不受证书规则限制 |
 | 备份证书 | 选中 → 「📋 导出证书」→ 保存为 .cer | — |
-| 封禁无签名软件 | 「🔒 封禁文件(哈希)」→ 选择文件 | ✅ 该精确文件被阻止 |
 | 预览影响 | CLI: `certlock --dry-run --block app.exe` | — |
 | 脚本化查询 | CLI: `certlock --list --json` 或 `--csv` | — |
 | 撤销操作 | 展开「最近操作」→ 点击「↩ 撤销上一步」→ 重启 | ✅ |
@@ -168,9 +167,6 @@ CertLock 支持纯命令行操作，方便企业 IT 批量部署和脚本化：
 ```bash
 # 封禁签名软件（自动提取证书）
 certlock --block "C:\Program Files\SomeApp\app.exe"
-
-# 封禁无签名软件（SHA256 哈希，自动拒绝系统目录）
-certlock --hash "C:\Users\Public\malware.exe"
 
 # 预览封禁影响（不实际写入）
 certlock --dry-run --block "C:\Program Files\SomeApp\app.exe"
@@ -222,7 +218,7 @@ Windows SRP 支持三级规则，优先级为 **路径 > 证书 > 哈希**。Cer
 
 > **典型场景**：你一键封了金山的所有证书签名软件，但 WPS 确实需要正常使用。此时给 `wps.exe` 加一条路径白名单，它就能在证书封禁下照常运行——其他金山系软件（驱动精灵、金山毒霸等）依然被封。
 
-**如何使用**：点击「查看哈希规则」→ 再点一次切到「查看路径白名单」→「🔓 添加白名单路径」选择 .exe 即可。
+**如何使用**：点击「查看路径白名单」→「🔓 添加白名单路径」选择 .exe 即可。
 
 > ⚠️ 路径白名单是 SRP 原生的 Path Rules (Unrestricted) 机制，不是 CertLock 自己实现的功能。白名单规则写的是精确文件路径，不支持通配符。
 
@@ -318,17 +314,11 @@ HKLM\SOFTWARE\Policies\Microsoft\Windows\Safer\CodeIdentifiers
 │
 ├── 0\Certificates\
 │   ├── {指纹1}\
-│   │   ├── ItemData       = <Base64 DER 证书>
+│   │   ├── ItemData       = <DER 证书>  (REG_BINARY)
 │   │   ├── SaferFlags     = 0          (0 = 不允许)
 │   │   └── Description    = "Block all software signed by ..."
 │   │
 │   └── {指纹2}\ ...
-│
-├── 0\Hashes\
-│   └── {GUID}\
-│       ├── ItemData       = <SHA256 哈希>
-│       ├── SaferFlags     = 0
-│       └── Description    = "Block file by hash: ..."
 │
 └── 0\Paths\
     └── {GUID}\
@@ -369,7 +359,7 @@ PE 文件
 ## ❓ 常见问题
 
 **Q: 为什么封禁了还能运行？**
-最常见的原因：① 厂商更换了数字证书（新证书指纹不同，旧封禁不覆盖新版本）→ 右键预设卡片「重新扫描」提取新证书即可；② 软件安装包无数字签名 → 使用「哈希封禁」功能按 SHA256 文件指纹阻止。
+最常见的原因是厂商更换了数字证书（新证书指纹不同，旧封禁不覆盖新版本）。请选择该厂商最新的已签名文件重新提取证书并封禁。
 
 **Q: 封禁后怎么恢复？**
 打开 CertLock → 在列表中选中对应证书 → 点击「✖ 移除选中」→ 重启计算机即可恢复运行。撤销操作也可以在「最近操作」面板中一键回滚。
@@ -392,7 +382,7 @@ PE 文件
 
 - [x] **暗色模式** — 跟随 Windows 系统主题自动切换 ✅ v1.4.0
 - [x] **策略备份与还原** — 导出/导入完整 SRP 策略 JSON 配置 ✅ v1.4.0
-- [x] **哈希规则封禁** — 支持无数字签名的流氓软件 ✅ v1.5.0
+- [x] **哈希规则迁移** — 停止创建未经验证的 SRP 哈希规则，保留旧规则清理能力 ✅ v2.0.0
 - [x] **命令行模式** — `certlock --block app.exe` 脚本化操作 ✅ v1.5.0
 - [x] **社区策略模板** — JSON 格式封禁列表，导入/导出共享 ✅ v1.5.0
 - [x] **操作历史与撤销** — 最近 20 步操作记录，一键回滚 ✅ v1.5.0

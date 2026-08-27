@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-CertLock v1.7.2 — Windows Certificate/Hash Blocker
+CertLock v2.0.0 — Windows Certificate Blocker
 =============================================
 A lightweight GUI tool to block unwanted software via Windows
 Software Restriction Policy (SRP) certificate & hash rules,
@@ -41,7 +41,7 @@ from tkinter import ttk, messagebox, filedialog
 # Constants
 # ============================================================
 APP_NAME    = "CertLock"
-APP_VERSION = "1.7.2"
+APP_VERSION = "2.0.0"
 SRP_ROOT    = r"SOFTWARE\Policies\Microsoft\Windows\Safer\CodeIdentifiers"
 CERT_RULES  = SRP_ROOT + "\\0\\Certificates"
 HASH_RULES  = SRP_ROOT + "\\0\\Hashes"
@@ -230,7 +230,7 @@ def check_policy_conflicts():
                 winreg.HKEY_LOCAL_MACHINE, SRP_ROOT + "\\0", 0,
                 winreg.KEY_READ | winreg.KEY_WOW64_64KEY
             )
-            expected_sub = {"Certificates", "Hashes"}
+            expected_sub = {"Certificates", "Hashes", "Paths"}
             idx = 0
             while True:
                 try:
@@ -360,10 +360,36 @@ def _import_to_trusted_publishers(raw_cert):
             pass
 
 
+def _refresh_policy():
+    """Request a policy refresh without treating a refresh failure as rollback.
+
+    The rule is already persistent once the registry write succeeds; Windows
+    also applies SRP after the next sign-in.  Callers must not claim immediate
+    enforcement solely because this best-effort refresh returned successfully.
+    """
+    try:
+        return subprocess.run(
+            ["gpupdate", "/target:computer", "/force"],
+            capture_output=True, timeout=30
+        ).returncode == 0
+    except Exception:
+        return False
+
+
 def reg_add_cert(thumbprint, cert_blob_b64, description):
     """Add a certificate rule to block. Returns True on success."""
     srp = certs = rule = None
     try:
+        thumbprint = thumbprint.replace(" ", "").upper()
+        if len(thumbprint) != 40 or any(c not in "0123456789ABCDEF" for c in thumbprint):
+            return False
+        raw_cert = base64.b64decode(cert_blob_b64, validate=True)
+        if hashlib.sha1(raw_cert).hexdigest().upper() != thumbprint:
+            return False
+        # Certificate rules do not work unless the signer is trusted.  Import
+        # this before creating the rule so a reported success is enforceable.
+        if not _import_to_trusted_publishers(raw_cert):
+            return False
         srp = reg_open_srp("w")
         # Ensure Certificates container exists
         try:
@@ -377,17 +403,10 @@ def reg_add_cert(thumbprint, cert_blob_b64, description):
         rule = winreg.CreateKey(
             winreg.HKEY_LOCAL_MACHINE, f"{CERT_RULES}\\{thumbprint}"
         )
-        raw_cert = base64.b64decode(cert_blob_b64)
         winreg.SetValueEx(rule, "ItemData", 0, winreg.REG_BINARY, raw_cert)
         winreg.SetValueEx(rule, "SaferFlags", 0, winreg.REG_DWORD, 0)
         winreg.SetValueEx(rule, "Description", 0, winreg.REG_SZ, description)
-        _import_to_trusted_publishers(raw_cert)
-
-        # Refresh group policy
-        subprocess.run(
-            ["gpupdate", "/force", "/target:computer"],
-            capture_output=True, timeout=30
-        )
+        _refresh_policy()
         return True
     except Exception:
         return False
@@ -655,45 +674,13 @@ def reg_list_hashes():
 
 
 def reg_add_hash(filepath_or_hash, description):
-    """Add a hash rule to block a file by its SHA256.
-    Accepts either a file path (computes SHA256) or a raw hex hash string.
-    Returns True on success."""
-    if len(filepath_or_hash) == 64 and all(c in '0123456789ABCDEFabcdef' for c in filepath_or_hash):
-        sha256 = filepath_or_hash.upper()
-    else:
-        try:
-            sha256 = _compute_sha256(filepath_or_hash)
-        except Exception:
-            return False
+    """Do not create SRP hash rules from an ordinary SHA-256 digest.
 
-    rule = None
-    try:
-        # Ensure Hashes container exists
-        try:
-            h = winreg.OpenKey(
-                winreg.HKEY_LOCAL_MACHINE, HASH_RULES, 0, winreg.KEY_ALL_ACCESS
-            )
-            winreg.CloseKey(h)
-        except FileNotFoundError:
-            winreg.CreateKey(winreg.HKEY_LOCAL_MACHINE, HASH_RULES)
-
-        # Create rule key
-        rule = winreg.CreateKey(
-            winreg.HKEY_LOCAL_MACHINE, f"{HASH_RULES}\\{sha256}"
-        )
-        winreg.SetValueEx(rule, "ItemData", 0, winreg.REG_BINARY, b'\x00' * 20)
-        winreg.SetValueEx(rule, "SaferFlags", 0, winreg.REG_DWORD, 0)
-        winreg.SetValueEx(rule, "Description", 0, winreg.REG_SZ, description)
-
-        # Refresh policy
-        subprocess.run(["gpupdate", "/target:computer", "/force"],
-                       capture_output=True, timeout=30)
-        return True
-    except Exception:
-        return False
-    finally:
-        if rule:
-            winreg.CloseKey(rule)
+    Modern SRP calculates a Windows-specific image hash; writing an invented
+    registry payload can silently create a rule that never matches.  v2 keeps
+    legacy-rule listing/removal only and refuses new unsafe hash writes.
+    """
+    return False
 
 
 def reg_remove_hash(sha256):
@@ -796,9 +783,10 @@ def reg_add_path_rule(filepath, description):
     """Add a Path rule (Unrestricted) to whitelist a specific program.
     Path rules take precedence over certificate/hash rules in SRP.
     Returns (success: bool, guid: str)."""
-    rule = None
+    srp = rule = None
     guid = "{" + str(uuid.uuid4()).upper() + "}"
     try:
+        srp = reg_open_srp("w")
         # Ensure Paths container exists
         try:
             h = winreg.OpenKey(
@@ -819,14 +807,14 @@ def reg_add_path_rule(filepath, description):
         winreg.SetValueEx(rule, "Description", 0, winreg.REG_SZ, description)
 
         # Refresh policy
-        subprocess.run(["gpupdate", "/target:computer", "/force"],
-                       capture_output=True, timeout=30)
+        _refresh_policy()
         return True, guid
     except Exception:
         return False, ""
     finally:
-        if rule:
-            winreg.CloseKey(rule)
+        for h in (rule, srp):
+            if h:
+                winreg.CloseKey(h)
 
 
 def reg_remove_path(guid):
@@ -864,10 +852,11 @@ def reg_remove_path(guid):
             if h:
                 winreg.CloseKey(h)
 def export_community_template(filepath, selected_entries):
-    """Export selected cert/hash rules as a community template JSON.
-    selected_entries: list of {type:'cert'|'hash', thumbprint/hash, description, cert_data/hash_data}
+    """Export selected certificate rules as a community template JSON.
+    selected_entries: list of {type:'cert', thumbprint, description, cert_data}
 
     Sanitization: strips local paths, usernames, and other PII from export."""
+    selected_entries = [entry for entry in selected_entries if entry.get('type') == 'cert']
     template = {
         'format_version': '1.0',
         'source': 'CertLock',
@@ -890,8 +879,6 @@ def export_community_template(filepath, selected_entries):
         if rule['type'] == 'cert':
             rule['thumbprint'] = entry.get('thumbprint', '')
             rule['cert_data'] = entry.get('cert_data', '')
-        else:
-            rule['sha256'] = entry.get('hash', '')
         template['rules'].append(rule)
 
     with open(filepath, 'w', encoding='utf-8') as f:
@@ -920,8 +907,6 @@ def import_community_template(filepath):
         return 0, 0, 0, 1
 
     existing_certs = {c['thumbprint'].upper() for c in reg_list_certs()}
-    existing_hashes = {h['hash'].upper() for h in reg_list_hashes()}
-
     added_cert = 0
     added_hash = 0
     skipped = 0
@@ -942,19 +927,6 @@ def import_community_template(filepath):
             if reg_add_cert(tp, blob, desc):
                 added_cert += 1
                 existing_certs.add(tp.upper())
-            else:
-                errors += 1
-        elif rtype == 'hash':
-            h = rule.get('sha256', '')
-            if not h or len(h) != 64:
-                errors += 1
-                continue
-            if h.upper() in existing_hashes:
-                skipped += 1
-                continue
-            if reg_add_hash(h, desc):
-                added_hash += 1
-                existing_hashes.add(h.upper())
             else:
                 errors += 1
         else:
@@ -1289,6 +1261,8 @@ def load_preset_cert_data():
                     0, winreg.KEY_READ
                 )
                 cert_blob, _ = winreg.QueryValueEx(rule, "ItemData")
+                if isinstance(cert_blob, bytes):
+                    cert_blob = base64.b64encode(cert_blob).decode("ascii")
                 winreg.CloseKey(rule)
             except Exception:
                 pass
@@ -1336,8 +1310,8 @@ class CertLockApp:
         # Operation history (max 20 entries)
         self.history = deque(maxlen=20)
 
-        # View toggle: cert, hash, or path rules
-        self.view_mode = "cert"  # "cert" | "hash" | "path"
+        # v2 manages certificate blocks and explicit path exceptions.
+        self.view_mode = "cert"  # "cert" | "path"
 
         # Policy conflicts detected at startup
         self.policy_conflicts = policy_conflicts or []
@@ -1450,7 +1424,7 @@ class CertLockApp:
         ).pack(anchor=tk.W)
         ttk.Label(
             title_frame,
-            text="Windows 证书/哈希封禁 + 路径白名单 | 单文件 · 便携 · 无残留",
+            text="Windows 证书封禁 + 路径白名单 | 单文件 · 便携 · 无残留",
             style="Subtitle.TLabel"
         ).pack(anchor=tk.W)
 
@@ -1475,7 +1449,7 @@ class CertLockApp:
         ).pack(side=tk.LEFT, padx=(8, 0))
         # View toggle
         self.btn_toggle_view = ttk.Button(
-            list_header, text="查看哈希规则", width=14,
+            list_header, text="查看路径白名单", width=14,
             command=self.on_toggle_view
         )
         self.btn_toggle_view.pack(side=tk.RIGHT)
@@ -1513,12 +1487,6 @@ class CertLockApp:
             command=self.on_block_new, width=16
         )
         self.btn_block.pack(side=tk.LEFT, padx=(0, 4))
-
-        self.btn_block_hash = ttk.Button(
-            btn_row1, text="🔒 封禁文件(哈希)",
-            command=self.on_block_hash, width=18
-        )
-        # Hidden until hash view is active
 
         self.btn_path_whitelist = ttk.Button(
             btn_row1, text="🔓 添加白名单路径",
@@ -1999,7 +1967,7 @@ class CertLockApp:
                 f"文件 \"{fname}\" 没有数字签名。\n\n"
                 "证书封禁需要目标软件具有数字签名。\n"
                 "请选择该厂商其他有签名的 .exe 文件。\n\n"
-                "替代方案：使用哈希规则或路径规则封禁。"
+                "替代方案：使用路径规则封禁。"
             ),
             'not_pe': (
                 "不是有效的可执行文件",
@@ -2396,25 +2364,20 @@ class CertLockApp:
     # Hash Rule UI
     # ============================================================
     def on_toggle_view(self):
-        """Cycle between certificate / hash / path rule views."""
-        # Cycle: cert → hash → path → cert
-        cycle = {"cert": "hash", "hash": "path", "path": "cert"}
+        """Cycle between certificate and path rule views."""
+        cycle = {"cert": "path", "path": "cert"}
         self.view_mode = cycle[self.view_mode]
 
         # Hide all mode-specific action buttons
-        for btn in (self.btn_block, self.btn_block_hash, self.btn_path_whitelist):
+        for btn in (self.btn_block, self.btn_path_whitelist):
             btn.pack_forget()
         self.btn_export.pack_forget()
 
         if self.view_mode == "cert":
             self.list_title.config(text="已封禁证书列表")
-            self.btn_toggle_view.config(text="查看哈希规则")
+            self.btn_toggle_view.config(text="查看路径白名单")
             self.btn_block.pack(side=tk.LEFT, padx=(0, 4), before=self.btn_remove)
             self.btn_export.pack(side=tk.RIGHT, padx=(4, 0))
-        elif self.view_mode == "hash":
-            self.list_title.config(text="已封禁哈希列表")
-            self.btn_toggle_view.config(text="查看路径白名单")
-            self.btn_block_hash.pack(side=tk.LEFT, padx=(0, 4), before=self.btn_remove)
         else:  # path
             self.list_title.config(text="路径白名单列表")
             self.btn_toggle_view.config(text="查看证书规则")
@@ -2534,8 +2497,8 @@ class CertLockApp:
             f"即将为以下程序添加路径白名单：\n\n"
             f"  文件: {fname}\n"
             f"  路径: {filepath}\n\n"
-            f"该程序将不受证书/哈希封禁策略限制。\n"
-            f"⚠ 路径规则优先级高于证书和哈希规则。\n\n"
+            f"该程序将不受证书封禁策略限制。\n"
+            f"⚠ 路径规则优先级高于证书规则。\n\n"
             f"确定添加？"
         )
         if not confirm:
@@ -3062,11 +3025,10 @@ def _parse_args():
 示例:
   certlock                              # 启动 GUI
   certlock --block "C:\\path\\app.exe"  # 提取证书并封禁
-  certlock --hash "C:\\path\\app.exe"   # 按 SHA256 哈希封禁(无签名软件)
   certlock --list                       # 列出所有规则
   certlock --list --json                # JSON 格式输出(脚本化)
   certlock --list --csv                 # CSV 格式输出
-  certlock --remove <指纹或哈希>        # 移除指定规则
+  certlock --remove <证书指纹>          # 移除指定证书规则
   certlock --dry-run --block app.exe    # 预览封禁影响，不实际写入
   certlock --export backup.json         # 导出全部规则
   certlock --import backup.json         # 导入规则
@@ -3076,9 +3038,9 @@ def _parse_args():
     parser.add_argument('--block', metavar='FILE',
                        help='提取签名证书并封禁')
     parser.add_argument('--hash', metavar='FILE',
-                       help='按 SHA256 哈希封禁文件（无签名软件）')
+                       help='已停用：v2 不再写入未经验证的 SRP 哈希规则')
     parser.add_argument('--remove', metavar='ID',
-                       help='移除指定证书指纹或 SHA256 哈希')
+                       help='移除指定证书指纹（也可清理旧版哈希规则）')
     parser.add_argument('--list', action='store_true',
                        help='列出所有已封禁规则')
     parser.add_argument('--json', action='store_true',
@@ -3218,46 +3180,10 @@ def _cli_block(filepath, dry_run=False):
 
 
 def _cli_hash_block(filepath, dry_run=False):
-    """CLI: block by SHA256 hash."""
-    if not os.path.isfile(filepath):
-        print(f"错误: 文件不存在 — {filepath}")
-        sys.exit(EXIT_FILE_NOT_FOUND)
-
-    # System directory protection
-    is_sys, sys_path = is_system_path(filepath)
-    if is_sys:
-        print(f"错误: 拒绝封禁系统目录下的文件！\n"
-              f"  文件: {filepath}\n"
-              f"  位于受保护路径: {sys_path}\n\n"
-              f"封禁系统文件可能导致操作系统无法启动。")
-        sys.exit(EXIT_OPERATION_FAILED)
-
-    sha256 = _compute_sha256(filepath)
-    fname = os.path.basename(filepath)
-    desc = f"Block {fname} (SHA256: {sha256[:16]}...)"
-
-    if dry_run:
-        print(f"[DRY-RUN] 将按哈希封禁:")
-        print(f"  文件: {fname}")
-        print(f"  路径: {filepath}")
-        print(f"  SHA256: {sha256}")
-        existing = reg_list_hashes()
-        if any(h['hash'].upper() == sha256 for h in existing):
-            print(f"  ⚠ 该哈希已存在于封禁列表中")
-        print(f"\n实际封禁请去掉 --dry-run 参数。")
-        return
-
-    if reg_add_hash(filepath, desc):
-        print(f"已封禁(哈希): {fname}")
-        print(f"SHA256: {sha256}")
-        print("⚠ 需要重启计算机才能完全生效。")
-        write_event_log(
-            f"Blocked file hash: {fname} ({sha256[:16]}...)",
-            1002, "WARNING"
-        )
-    else:
-        print("封禁失败（请以管理员身份运行）")
-        sys.exit(EXIT_OPERATION_FAILED)
+    """Reject retired hash-rule creation without mutating SRP."""
+    print("v2 不创建 SRP 哈希规则：Windows 要求由其策略组件计算映像哈希，"
+          "普通 SHA-256 注册表写入不能保证可执行封禁。")
+    sys.exit(EXIT_OPERATION_FAILED)
 
 
 def _cli_export(filepath):
@@ -3308,7 +3234,6 @@ def _cli_template_export(filepath):
     """CLI: export community template."""
     from datetime import datetime
     certs = reg_list_certs()
-    hashes = reg_list_hashes()
     entries = []
     for c in certs:
         entries.append({
@@ -3316,12 +3241,6 @@ def _cli_template_export(filepath):
             'thumbprint': c['thumbprint'],
             'description': c['description'],
             'cert_data': c.get('cert_data', ''),
-        })
-    for h in hashes:
-        entries.append({
-            'type': 'hash',
-            'hash': h['hash'],
-            'description': h['description'],
         })
     count = export_community_template(filepath, entries)
     print(f"社区模板已导出: {count} 条规则 → {filepath}")

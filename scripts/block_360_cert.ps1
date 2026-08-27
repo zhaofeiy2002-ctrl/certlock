@@ -54,13 +54,13 @@ if (-not (Test-Path $srpPath)) {
 }
 
 # Set default security level
-New-ItemProperty -Path $srpPath -Name "DefaultLevel" -Value 0x00000000 -PropertyType DWord -Force | Out-Null
+New-ItemProperty -Path $srpPath -Name "DefaultLevel" -Value 0x00040000 -PropertyType DWord -Force | Out-Null
 
 # Set policy for certificate rules enforcement
 New-ItemProperty -Path $srpPath -Name "PolicyScope" -Value 0x00000000 -PropertyType DWord -Force | Out-Null
 
-# Set to enforce certificate rules
-New-ItemProperty -Path $srpPath -Name "EnforcementMode" -Value 0x00000001 -PropertyType DWord -Force | Out-Null
+# Enable certificate rules
+New-ItemProperty -Path $srpPath -Name "authenticodeenabled" -Value 0x00000001 -PropertyType DWord -Force | Out-Null
 
 # Create the certificate rules path
 $certRulesPath = "$srpPath\0\Certificates"
@@ -76,10 +76,16 @@ if (-not (Test-Path $rulePath)) {
 }
 
 # Set the certificate rule properties
-$certBlob = [System.Convert]::ToBase64String($sig.SignerCertificate.Export([System.Security.Cryptography.X509Certificates.X509ContentType]::Cert))
-New-ItemProperty -Path $rulePath -Name "ItemData" -Value $certBlob -PropertyType String -Force | Out-Null
+$certBlob = $sig.SignerCertificate.Export([System.Security.Cryptography.X509Certificates.X509ContentType]::Cert)
+New-ItemProperty -Path $rulePath -Name "ItemData" -Value $certBlob -PropertyType Binary -Force | Out-Null
 New-ItemProperty -Path $rulePath -Name "SaferFlags" -Value 0x00000000 -PropertyType DWord -Force | Out-Null
 New-ItemProperty -Path $rulePath -Name "Description" -Value "Block all software signed by Beijing Qihu Technology Co., Ltd. (360)" -PropertyType String -Force | Out-Null
+
+# SRP certificate rules require the signer certificate in the machine store.
+$store = New-Object System.Security.Cryptography.X509Certificates.X509Store("TrustedPublisher", "LocalMachine")
+$store.Open([System.Security.Cryptography.X509Certificates.OpenFlags]::ReadWrite)
+$store.Add($sig.SignerCertificate)
+$store.Close()
 
 Write-Host "Certificate rule added successfully!" -ForegroundColor Green
 Write-Host "Rule: ALL software signed by Beijing Qihu Technology Co., Ltd. is now BLOCKED"
