@@ -1,0 +1,76 @@
+name: Release CertLock v2.1.0
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [master]
+    paths: ['.github/workflows/release-v2.1.0.yml']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: certlock-release-v2.1.0
+  cancel-in-progress: false
+
+jobs:
+  release:
+    if: github.ref == 'refs/heads/master'
+    runs-on: windows-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      PYTHONIOENCODING: utf-8
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12.9'
+      - name: Install builder and validate
+        run: |
+          python -m pip install pyinstaller==6.21.0
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          python -c "import certlock; assert certlock.APP_VERSION == '2.1.0'"
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          python -m unittest discover -s tests -v
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Build and verify portable executable
+        run: |
+          python -m PyInstaller certlock.spec --distpath dist/CertLock_v2.1.0-portable --workpath build/release --noconfirm
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          python tests/verify_packaged.py
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Package
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $release = 'dist/CertLock_v2.1.0-portable'
+          Copy-Item -LiteralPath 'docs/常用预设使用说明.md' -Destination "$release/使用说明.md"
+          Copy-Item -LiteralPath LICENSE -Destination "$release/LICENSE"
+          Get-ChildItem -LiteralPath $release -File | ForEach-Object {
+            $hash = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            "$hash  $($_.Name)"
+          } | Set-Content -LiteralPath "$release/SHA256SUMS.txt" -Encoding utf8
+          Compress-Archive -LiteralPath $release -DestinationPath dist/CertLock_v2.1.0-portable.zip
+          $zipHash = (Get-FileHash -LiteralPath dist/CertLock_v2.1.0-portable.zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$zipHash  CertLock_v2.1.0-portable.zip" | Set-Content -LiteralPath dist/CertLock_v2.1.0-SHA256.txt -Encoding utf8
+      - name: Publish release after assets are uploaded
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $existing = gh release view v2.1.0 --json isDraft 2>$null
+          if ($LASTEXITCODE -eq 0) {
+            if (-not ($existing | ConvertFrom-Json).isDraft) { throw 'v2.1.0 is already published; refusing to overwrite it.' }
+          } else {
+            gh release create v2.1.0 --target $env:GITHUB_SHA --title 'CertLock v2.1.0 - 常用预设与保留软件' --notes-file docs/releases/v2.1.0.md --draft
+            if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          }
+          gh release upload v2.1.0 dist/CertLock_v2.1.0-portable.zip dist/CertLock_v2.1.0-SHA256.txt --clobber
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          gh release edit v2.1.0 --draft=false --latest
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }

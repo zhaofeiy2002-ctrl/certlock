@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-CertLock v2.0.0 — Windows Certificate Blocker
+CertLock v2.1.0 — Windows Certificate Blocker
 =============================================
 A lightweight GUI tool to block unwanted software via Windows
 Software Restriction Policy (SRP) certificate & hash rules,
@@ -29,6 +29,7 @@ import hashlib
 import base64
 import struct
 import tempfile
+import copy
 import uuid
 import argparse
 import winreg
@@ -37,11 +38,15 @@ import tkinter as tk
 from collections import deque
 from tkinter import ttk, messagebox, filedialog
 
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, 'reconfigure'):
+        _stream.reconfigure(encoding='utf-8')
+
 # ============================================================
 # Constants
 # ============================================================
 APP_NAME    = "CertLock"
-APP_VERSION = "2.0.0"
+APP_VERSION = "2.1.0"
 SRP_ROOT    = r"SOFTWARE\Policies\Microsoft\Windows\Safer\CodeIdentifiers"
 CERT_RULES  = SRP_ROOT + "\\0\\Certificates"
 HASH_RULES  = SRP_ROOT + "\\0\\Hashes"
@@ -80,14 +85,14 @@ CERT_PRESETS = {
         "products":   "360安全卫士 / 360浏览器 / 360驱动大师 / 360软件管家 / 360压缩",
         "cert_data":  True,  # Embedded in presets_data dict below
     },
-    "金山 (毒霸/驱动精灵/WPS)": {
+    "金山安全 (毒霸/驱动精灵)": {
         "thumbprint": "91F82992D80651CDACF4D96A307F8434BA5838CC",
         "thumbprints": [
             "91F82992D80651CDACF4D96A307F8434BA5838CC",
             "C1E3BDD81C9A773163D5B47A7F50111EE00CBF71",
         ],
         "vendor":     "Beijing Kingsoft Security software Co.,Ltd",
-        "products":   "金山毒霸 / 驱动精灵 / WPS Office / 金山卫士",
+        "products":   "金山毒霸 / 驱动精灵 / 金山卫士（以实际签名为准）",
         "cert_data":  True,  # Embedded certs from kinsthomeui + DGSetup
     },
     "鲁大师": {
@@ -114,6 +119,16 @@ CERT_PRESETS = {
 
 # Pre-loaded certificate data (Base64 DER)
 PRESET_CERT_DATA = {}
+
+COMMON_PRESET_FILES = (
+    ("360", "cert_360_b64.txt"),
+    ("2345", "cert_2345_b64.txt"),
+    ("鲁大师", "cert_ludashi_b64.txt"),
+    ("腾讯共享签名（可能影响 QQ / 腾讯视频）", "cert_tencent_b64.txt"),
+    ("金山安全证书 1", "cert_kingsoft_b64.txt"),
+    ("金山安全证书 2", "cert_kingsoft_dg_b64.txt"),
+)
+WPS_PROTECTION = "wps-signers-v1"
 
 
 # ============================================================
@@ -172,7 +187,7 @@ def _check_cert_expiry(b64_data):
     Returns (expired: bool, not_after_display: str)."""
     try:
         der = base64.b64decode(b64_data)
-        _, _, _, _, not_after = _parse_x509_subject_and_issuer(der)
+        _, _, _, not_after = _parse_x509_subject_and_issuer(der)
         if not not_after:
             return False, ""
         # Parse UTCTime (YYMMDDHHMMSSZ) or GeneralizedTime (YYYYMMDDHHMMSSZ)
@@ -897,42 +912,212 @@ def _sanitize_export_desc(desc):
     return desc
 
 
-def import_community_template(filepath):
+def build_common_template():
+    """Build a portable preset from bundled DER data; never consult local policy."""
+    rules = []
+    for label, filename in COMMON_PRESET_FILES:
+        with open(os.path.join(get_app_dir(), 'certs', filename), encoding='ascii') as f:
+            blob = f.read().strip()
+        raw = base64.b64decode(blob, validate=True)
+        subject, _, _, expiry = _parse_x509_subject_and_issuer(raw)
+        if subject == 'Unknown':
+            raise ValueError('预设证书无法解析: ' + filename)
+        rules.append(dict(type='cert', description=label, disallowed=True,
+                          thumbprint=hashlib.sha1(raw).hexdigest().upper(),
+                          cert_data=blob, subject=subject, not_after=expiry))
+    return dict(format_version='2.0', source='CertLock', protection=WPS_PROTECTION,
+                vendor_info=dict(name='常用预设（保留 WPS）', notes=(
+                    '仅覆盖内置六张签名证书；不是所有版本或所有软件的完整黑名单。'
+                    '自动查找 WPS；未能核对时跳过金山证书。跳过与保留程序签名相同的规则。'
+                    '腾讯证书可能同时影响 QQ、腾讯视频。旧证书不覆盖厂商换证后的文件。')),
+                rules=rules)
+
+
+def discover_wps_directories():
+    """Discover registered/common WPS locations without crawling entire drives."""
+    candidates = []
+    for hive in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
+        for view in (winreg.KEY_WOW64_64KEY, winreg.KEY_WOW64_32KEY):
+            for exe in ('wps.exe', 'et.exe', 'wpp.exe'):
+                try:
+                    key_path = r'SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths' + '\\' + exe
+                    with winreg.OpenKey(hive, key_path, 0, winreg.KEY_READ | view) as key:
+                        exe_path = os.path.expandvars(winreg.QueryValue(key, None).strip('"'))
+                        if os.path.isfile(exe_path):
+                            candidates.append(os.path.dirname(exe_path))
+                except OSError:
+                    pass
+            try:
+                with winreg.OpenKey(hive, r'SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall', 0, winreg.KEY_READ | view) as key:
+                    for i in range(winreg.QueryInfoKey(key)[0]):
+                        try:
+                            with winreg.OpenKey(key, winreg.EnumKey(key, i)) as sub:
+                                name = winreg.QueryValueEx(sub, 'DisplayName')[0].casefold()
+                                if 'wps' in name or '金山办公' in name:
+                                    candidates.append(winreg.QueryValueEx(sub, 'InstallLocation')[0])
+                        except (OSError, AttributeError):
+                            continue
+            except OSError:
+                pass
+    bases = [os.environ.get(k, '') for k in ('ProgramFiles', 'ProgramFiles(x86)', 'LOCALAPPDATA')]
+    for base in filter(None, bases):
+        candidates.extend([os.path.join(base, 'Kingsoft', 'WPS Office'), os.path.join(base, 'WPS Office')])
+    roots = []
+    for candidate in candidates:
+        if not isinstance(candidate, str) or not candidate.strip():
+            continue
+        path = os.path.normcase(os.path.abspath(os.path.expandvars(candidate.strip('"'))))
+        if not os.path.isdir(path) or path == os.path.abspath(os.path.splitdrive(path)[0] + os.sep):
+            continue
+        if any(path == os.path.normcase(os.path.abspath(b)) for b in bases if b):
+            continue
+        if not any(path == root or path.startswith(root + os.sep) for root in roots):
+            roots = [root for root in roots if not root.startswith(path + os.sep)]
+            roots.append(path)
+    return roots
+
+
+def scan_wps_signers(directory):
+    """Read embedded signers only; unsigned helpers cannot match a cert rule."""
+    if not os.path.isdir(directory):
+        raise ValueError('WPS 安装目录不存在。')
+    signers, main_found = set(), False
+    count = 0
+    def walk_error(error):
+        raise ValueError('无法完整读取 WPS 目录: ' + str(error))
+    for root, _, files in os.walk(directory, onerror=walk_error):
+        for name in files:
+            if not name.lower().endswith(('.exe', '.dll')):
+                continue
+            count += 1
+            if count > 10000:
+                raise ValueError('目录范围过大，请选择 WPS 安装目录。')
+            info = extract_cert_from_exe(os.path.join(root, name))
+            if info.get('error') == 'no_signature':
+                continue
+            if info.get('error') or not info.get('THUMBPRINT'):
+                raise ValueError('无法核对 WPS 文件签名，尚未导入: ' + name)
+            signers.add(info['THUMBPRINT'].upper())
+            if name.lower() in {'wps.exe', 'et.exe', 'wpp.exe'}:
+                main_found = True
+    if not main_found:
+        raise ValueError('目录内未找到可核对签名的 wps.exe、et.exe 或 wpp.exe。')
+    return signers
+
+
+def plan_community_template(data, wps_dir=None, protected_files=None):
+    """Validate every rule before any write and calculate explicit WPS exclusions."""
+    if not isinstance(data, dict) or data.get('format_version', '1.0') not in {'1.0', '2.0'}:
+        raise ValueError('不支持的模板格式。')
+    rules = data.get('rules')
+    if not isinstance(rules, list) or not rules or len(rules) > 200:
+        raise ValueError('模板需要包含 1–200 条证书规则。')
+    protection = data.get('protection')
+    if protection not in (None, WPS_PROTECTION):
+        raise ValueError('不支持的模板保护策略。')
+    validated = []
+    seen = set()
+    for entry in rules:
+        if not isinstance(entry, dict) or entry.get('type', 'cert') != 'cert' or entry.get('disallowed', True) is not True:
+            raise ValueError('模板仅支持明确的证书禁止规则。')
+        try:
+            tp = entry['thumbprint'].replace(' ', '').upper()
+            blob = entry['cert_data']
+            raw = base64.b64decode(blob, validate=True)
+        except (KeyError, ValueError, TypeError, AttributeError):
+            raise ValueError('模板证书数据无效。') from None
+        subject, _, _, expiry = _parse_x509_subject_and_issuer(raw)
+        if hashlib.sha1(raw).hexdigest().upper() != tp or subject == 'Unknown':
+            raise ValueError('证书内容与指纹不一致，或 DER 无效。')
+        if tp in seen:
+            raise ValueError('模板包含重复证书: ' + tp)
+        seen.add(tp)
+        desc = entry.get('description', subject)
+        if not isinstance(desc, str):
+            raise ValueError('规则描述必须是文本。')
+        validated.append(dict(thumbprint=tp, cert_data=blob, description=desc,
+                              subject=subject, not_after=expiry,
+                              expired=_check_cert_expiry(blob)[0]))
+    wps_dirs = ([wps_dir] if wps_dir else discover_wps_directories()) if protection else []
+    wps_signers = set()
+    for directory in wps_dirs:
+        wps_signers.update(scan_wps_signers(directory))
+    protected = set(wps_signers)
+    for path in protected_files or []:
+        info = extract_cert_from_exe(path)
+        if info.get('error') or not info.get('THUMBPRINT'):
+            raise ValueError('无法核对保留程序签名，未导入: ' + os.path.basename(path))
+        protected.add(info['THUMBPRINT'].upper())
+    existing = reg_list_certs()
+    if protected & {c['thumbprint'].upper() for c in existing if c.get('disallowed')}:
+        raise ValueError('现有证书禁止规则已与 WPS / 保留程序签名冲突，请先单独核查；本次未写入规则。')
+    existing_tps = {c['thumbprint'].upper() for c in existing}
+    plan = dict(add=[], skip=[], protection=protection, wps_checked=bool(wps_signers),
+                wps_directories=wps_dirs, protected_files=list(protected_files or []))
+    for rule in validated:
+        subject = rule['subject'].casefold()
+        reason = ''
+        if protection and ('office' in subject or 'wps' in subject or '金山办公' in subject):
+            reason = 'WPS / Office 签名保护'
+        elif rule['thumbprint'] in protected:
+            reason = '与 WPS / 保留程序的签名相同'
+        elif protection and not wps_signers and ('kingsoft' in subject or '金山' in subject):
+            reason = '未核对 WPS 安装目录，跳过金山证书'
+        elif rule['thumbprint'] in existing_tps:
+            reason = '本机已有同指纹规则（保持原样）'
+        if reason:
+            plan['skip'].append(dict(rule, reason=reason))
+        else:
+            plan['add'].append(rule)
+    return plan
+
+
+def describe_template_plan(plan):
+    lines = ['计划添加 %d 条；跳过 %d 条。' % (len(plan['add']), len(plan['skip']))]
+    if plan['protection']:
+        lines.append('WPS：已核对 %d 个安装目录。' % len(plan['wps_directories']) if plan['wps_checked'] else 'WPS：未能定位安装目录，已跳过金山证书。')
+    if plan['protected_files']:
+        lines.append('额外保留程序：%d 个。' % len(plan['protected_files']))
+    for rule in plan['add']:
+        expired = ' [证书已过期，覆盖范围需复核]' if rule['expired'] else ''
+        lines.append('+ %s%s\n  %s' % (rule['description'], expired, rule['thumbprint']))
+    for rule in plan['skip']:
+        lines.append('- %s：%s' % (rule['description'], rule['reason']))
+    if plan['protection']:
+        lines.append('不会创建 WPS 路径白名单，也不会移除本机已有规则。')
+    return '\n'.join(lines)
+
+
+def apply_template_plan(plan):
+    """Back up certificate policy before adding; report partial failures honestly."""
+    backup_path = ''
+    if plan['add']:
+        snapshot = reg_export_all_rules()
+        # Registry ItemData is binary; JSON backups use the existing Base64 format.
+        for cert in snapshot['certificates']:
+            if isinstance(cert.get('cert_data'), bytes):
+                cert['cert_data'] = base64.b64encode(cert['cert_data']).decode('ascii')
+        snapshot['planned_additions'] = [r['thumbprint'] for r in plan['add']]
+        directory = os.path.join(os.environ.get('LOCALAPPDATA', os.path.expanduser('~')), 'CertLock', 'backups')
+        os.makedirs(directory, exist_ok=True)
+        with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', prefix='before-template-', suffix='.json', dir=directory, delete=False) as f:
+            json.dump(snapshot, f, ensure_ascii=False, indent=2)
+            backup_path = f.name
+    added, failed = [], []
+    for rule in plan['add']:
+        ok = reg_add_cert(rule['thumbprint'], rule['cert_data'], rule['description'])
+        (added if ok else failed).append(rule['thumbprint'])
+    return dict(added=added, failed=failed, skipped=len(plan['skip']), backup=backup_path)
+
+
+def import_community_template(filepath, wps_dir=None, protected_files=None):
     """Import rules from a community template JSON.
     Returns (added_cert, added_hash, skipped, errors)."""
     with open(filepath, 'r', encoding='utf-8') as f:
         data = json.load(f)
 
-    if not isinstance(data, dict) or 'rules' not in data:
-        return 0, 0, 0, 1
-
-    existing_certs = {c['thumbprint'].upper() for c in reg_list_certs()}
-    added_cert = 0
-    added_hash = 0
-    skipped = 0
-    errors = 0
-
-    for rule in data.get('rules', []):
-        rtype = rule.get('type', 'cert')
-        desc = rule.get('description', 'Blocked via community template')
-        if rtype == 'cert':
-            tp = rule.get('thumbprint', '')
-            blob = rule.get('cert_data', '')
-            if not tp or not blob:
-                errors += 1
-                continue
-            if tp.upper() in existing_certs:
-                skipped += 1
-                continue
-            if reg_add_cert(tp, blob, desc):
-                added_cert += 1
-                existing_certs.add(tp.upper())
-            else:
-                errors += 1
-        else:
-            errors += 1
-
-    return added_cert, added_hash, skipped, errors
+    report = apply_template_plan(plan_community_template(data, wps_dir, protected_files))
+    return len(report['added']), 0, report['skipped'], len(report['failed'])
 
 
 # ============================================================
@@ -1539,6 +1724,9 @@ class CertLockApp:
             command=self.on_import_template, width=14
         )
         self.btn_template_import.pack(side=tk.RIGHT, padx=(0, 4))
+
+        ttk.Button(main_frame, text="常用预设（保留 WPS）",
+                   command=self.on_common_preset).pack(anchor=tk.W, pady=(0, 8))
 
         # Separator
         ttk.Separator(main_frame, orient=tk.HORIZONTAL).pack(fill=tk.X)
@@ -2498,7 +2686,7 @@ class CertLockApp:
             f"  文件: {fname}\n"
             f"  路径: {filepath}\n\n"
             f"该程序将不受证书封禁策略限制。\n"
-            f"⚠ 路径规则优先级高于证书规则。\n\n"
+            f"⚠ 证书规则优先于路径规则；路径允许不能覆盖证书禁止。\n\n"
             f"确定添加？"
         )
         if not confirm:
@@ -2611,76 +2799,122 @@ class CertLockApp:
         except Exception as e:
             messagebox.showerror("导出失败", str(e))
 
+    def on_common_preset(self):
+        try:
+            self._configure_template(build_common_template())
+        except Exception as e:
+            messagebox.showerror("预设读取失败", str(e))
+
     def on_import_template(self):
-        """Import rules from a community template JSON."""
-        from datetime import datetime
         filepath = filedialog.askopenfilename(
-            title="选择社区模板文件",
-            filetypes=[("JSON 文件", "*.json"), ("所有文件", "*.*")]
+            title="选择社区模板文件", filetypes=[("JSON 文件", "*.json")]
         )
         if not filepath:
             return
-
         try:
-            with open(filepath, 'r', encoding='utf-8') as f:
-                data = json.load(f)
+            with open(filepath, encoding="utf-8-sig") as f:
+                self._configure_template(json.load(f))
         except Exception as e:
-            messagebox.showerror("读取失败", f"无法读取模板文件:\n{str(e)}")
+            messagebox.showerror("模板导入失败", str(e))
+
+    def _configure_template(self, data):
+        if not isinstance(data, dict) or not isinstance(data.get('rules'), list) or not data['rules'] or len(data['rules']) > 200:
+            raise ValueError('模板需要包含 1–200 条规则。')
+        if not all(isinstance(r, dict) for r in data['rules']):
+            raise ValueError('模板规则格式错误。')
+        dialog = tk.Toplevel(self.root)
+        dialog.title('配置封禁预设')
+        dialog.geometry('660x560')
+        dialog.minsize(560, 480)
+        dialog.transient(self.root)
+        body = ttk.Frame(dialog, padding=16)
+        body.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(body, text='勾选要封禁的签名范围', font=('Segoe UI', 11, 'bold')).pack(anchor=tk.W)
+        canvas = tk.Canvas(body, height=220, highlightthickness=0)
+        choices = ttk.Frame(canvas)
+        bar = ttk.Scrollbar(body, orient=tk.VERTICAL, command=canvas.yview)
+        canvas.configure(yscrollcommand=bar.set)
+        bar.pack(side=tk.RIGHT, fill=tk.Y)
+        canvas.pack(fill=tk.BOTH, expand=True)
+        canvas.create_window((0, 0), window=choices, anchor=tk.NW)
+        choices.bind('<Configure>', lambda event: canvas.configure(scrollregion=canvas.bbox('all')))
+        selected = []
+        for rule in data['rules']:
+            var = tk.BooleanVar(value=True)
+            selected.append(var)
+            label = str(rule.get('description') or rule.get('thumbprint') or '未命名证书')[:100]
+            ttk.Checkbutton(choices, text=label, variable=var).pack(anchor=tk.W, pady=5)
+        wps_dir, keep_files = [None], []
+        wps_label = ttk.Label(body, text='WPS：自动检测；未找到时跳过金山证书。', wraplength=570)
+        if data.get('protection') == WPS_PROTECTION:
+            wps_label.pack(anchor=tk.W, pady=(12, 4))
+        keep_label = ttk.Label(body, text='额外保留：无', wraplength=570)
+        keep_label.pack(anchor=tk.W, pady=4)
+        def choose_wps():
+            path = filedialog.askdirectory(parent=dialog, title='选择 WPS 安装目录')
+            if path:
+                wps_dir[0] = path
+                wps_label.config(text='WPS：' + path)
+        def choose_keep():
+            paths = filedialog.askopenfilenames(parent=dialog, title='选择要保留的软件主程序', filetypes=[('程序', '*.exe;*.dll')])
+            keep_files.extend(p for p in paths if p not in keep_files)
+            keep_label.config(text='额外保留：' + ('、'.join(os.path.basename(p) for p in keep_files) or '无'))
+        actions = ttk.Frame(body)
+        actions.pack(fill=tk.X, pady=10)
+        if data.get('protection') == WPS_PROTECTION:
+            ttk.Button(actions, text='手动指定 WPS', command=choose_wps).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(actions, text='添加保留程序', command=choose_keep).pack(side=tk.LEFT)
+        def chosen_data():
+            chosen = copy.deepcopy(data)
+            chosen['rules'] = [r for r, var in zip(chosen['rules'], selected) if var.get()]
+            if not chosen['rules']:
+                raise ValueError('请至少选择一条规则。')
+            return chosen
+        def export_selection():
+            try:
+                chosen = chosen_data()
+                path = filedialog.asksaveasfilename(parent=dialog, title='导出预设（不含本机路径）', defaultextension='.json', filetypes=[('JSON', '*.json')])
+                if path:
+                    with open(path, 'x', encoding='utf-8') as f:
+                        json.dump(chosen, f, ensure_ascii=False, indent=2)
+                    messagebox.showinfo('已导出', 'WPS 会在目标电脑重新检测；额外保留程序需在目标电脑重新选择。', parent=dialog)
+            except Exception as e:
+                messagebox.showerror('导出未完成', str(e), parent=dialog)
+        def preview():
+            try:
+                self._preview_template_import(chosen_data(), wps_dir[0], keep_files)
+            except Exception as e:
+                messagebox.showerror('导入未完成', str(e), parent=dialog)
+        ttk.Button(body, text='导出勾选的预设', command=export_selection).pack(side=tk.LEFT)
+        ttk.Button(body, text='预览与导入', command=preview).pack(side=tk.RIGHT)
+
+    def _preview_template_import(self, data, wps_dir=None, protected_files=None):
+        plan = plan_community_template(data, wps_dir, protected_files)
+        detail = describe_template_plan(plan)
+        if not plan["add"]:
+            messagebox.showinfo("无需添加规则", detail)
             return
-
-        rules = data.get('rules', [])
-        if not rules:
-            messagebox.showinfo("空模板", "模板文件中没有封禁规则。")
+        if not messagebox.askyesno(
+            "确认导入证书预设",
+            detail + "\n\n规则针对同证书签名的所有程序；腾讯证书也可能影响 QQ、腾讯视频。"
+            "\n写入前自动保存证书策略备份。注销或重启后仍需验证实际拦截。\n\n确定导入？"
+        ):
             return
-
-        vendor_info = data.get('vendor_info', {})
-        vendor_name = vendor_info.get('name', '未知')
-        fmt_ver = data.get('format_version', '未知')
-
-        cert_count = sum(1 for r in rules if r.get('type', 'cert') == 'cert')
-        hash_count = sum(1 for r in rules if r.get('type') == 'hash')
-        total_rules = len(rules)
-
-        # Batch confirmation for large imports
-        if total_rules >= BATCH_WARN_THRESHOLD:
-            confirm = messagebox.askyesno(
-                "批量导入确认",
-                f"⚠ 导入规则数量较多（{total_rules} 条），请仔细确认：\n\n"
-                f"  格式版本: {fmt_ver}\n"
-                f"  来源厂商: {vendor_name}\n"
-                f"  证书规则: {cert_count} 条\n"
-                f"  哈希规则: {hash_count} 条\n"
-                f"  导出者: {data.get('exported_by', '未知')}\n\n"
-                f"建议先执行「备份策略」以保存当前状态。\n\n"
-                f"⚠ 需要重启计算机才能完全生效。\n\n"
-                f"确定导入？"
-            )
+        # Recheck local files and rules after the confirmation dialog.
+        rechecked = plan_community_template(data, wps_dir, protected_files)
+        if rechecked != plan:
+            raise ValueError("签名或本机规则在预览后发生变化，请重新预览。")
+        report = apply_template_plan(plan)
+        msg = "新增 %d 条，跳过 %d 条，失败 %d 条。\n备份：%s" % (
+            len(report["added"]), report["skipped"], len(report["failed"]), report["backup"])
+        if report["failed"]:
+            msg += "\n未成功的指纹：\n" + "\n".join(report["failed"])
+            messagebox.showwarning("导入存在失败", msg)
         else:
-            confirm = messagebox.askyesno(
-                "确认导入",
-                f"模板信息:\n"
-                f"  格式版本: {fmt_ver}\n"
-                f"  来源厂商: {vendor_name}\n"
-                f"  证书规则: {cert_count} 条\n"
-                f"  哈希规则: {hash_count} 条\n"
-                f"  导出者: {data.get('exported_by', '未知')}\n\n"
-                f"将导入 {total_rules} 条规则。\n"
-                f"⚠ 需要重启计算机才能完全生效。\n\n"
-                f"确定导入？"
-            )
-        if not confirm:
-            return
-
-        added_cert, added_hash, skipped, errors = import_community_template(filepath)
-        msg = f"导入完成:\n  证书: +{added_cert} 条\n  哈希: +{added_hash} 条\n  已存在跳过: {skipped} 条"
-        if errors:
-            msg += f"\n  失败: {errors} 条"
-        messagebox.showinfo("导入结果", msg)
-        self.status_label.config(
-            text=f"模板导入完成 — 证书+{added_cert}, 哈希+{added_hash}"
-        )
-        if added_cert or added_hash:
-            self._add_history("template_import", "", f"+{added_cert}C +{added_hash}H")
+            messagebox.showinfo("导入结果", msg)
+        if report["added"]:
+            self._add_history("template_import", "", "+%d certificates" % len(report["added"]))
+        self.status_label.config(text="预设导入：新增 %d，失败 %d" % (len(report["added"]), len(report["failed"])))
         self.refresh_list()
 
     # ============================================================
@@ -3057,6 +3291,12 @@ def _parse_args():
                        help='导出社区模板 JSON')
     parser.add_argument('--template-import', metavar='FILE',
                        help='导入社区模板 JSON')
+    parser.add_argument('--preset-export', metavar='FILE',
+                       help='导出内置常用预设（保留 WPS），无需管理员权限')
+    parser.add_argument('--wps-dir', metavar='DIR',
+                       help='导入 WPS 保护模板时核对本机 WPS 安装目录')
+    parser.add_argument('--keep-file', metavar='FILE', action='append', default=[],
+                       help='保留此程序签名；可重复指定，用于模板导入')
     parser.add_argument('--version', action='version',
                        version=f'{APP_NAME} v{APP_VERSION}')
     # parse_known_args is robust to extra args (e.g., from ShellExecute
@@ -3246,10 +3486,20 @@ def _cli_template_export(filepath):
     print(f"社区模板已导出: {count} 条规则 → {filepath}")
 
 
-def _cli_template_import(filepath):
+def _cli_template_import(filepath, dry_run=False, wps_dir=None, protected_files=None):
     """CLI: import community template."""
-    added_cert, added_hash, skipped, errors = import_community_template(filepath)
-    print(f"证书: +{added_cert}  哈希: +{added_hash}  跳过: {skipped}  失败: {errors}")
+    with open(filepath, encoding='utf-8-sig') as f:
+        plan = plan_community_template(json.load(f), wps_dir, protected_files)
+    print(describe_template_plan(plan))
+    if dry_run:
+        print('试运行结束，未写入任何策略。')
+        return
+    report = apply_template_plan(plan)
+    print('证书: +%d  跳过: %d  失败: %d\n备份: %s' % (
+        len(report['added']), report['skipped'], len(report['failed']), report['backup']))
+    if report['failed']:
+        print('失败指纹: ' + ', '.join(report['failed']))
+        sys.exit(EXIT_OPERATION_FAILED)
     print("⚠ 需要重启计算机才能完全生效。")
 
 
@@ -3293,7 +3543,13 @@ def _run_cli(args):
         has_action = True
 
     if args.template_import:
-        _cli_template_import(args.template_import)
+        _cli_template_import(args.template_import, dry_run=args.dry_run, wps_dir=args.wps_dir, protected_files=args.keep_file)
+        has_action = True
+
+    if args.preset_export:
+        with open(args.preset_export, 'x', encoding='utf-8') as f:
+            json.dump(build_common_template(), f, ensure_ascii=False, indent=2)
+        print('已导出常用预设：' + args.preset_export)
         has_action = True
 
     if not has_action:
@@ -3312,16 +3568,24 @@ def main():
         args.list, args.remove, args.block, args.hash,
         args.export, args.import_file,
         args.template_export, args.template_import,
+        args.preset_export,
     ])
 
     if has_cli_action:
         # CLI mode
-        if not is_admin():
+        if args.dry_run and (args.remove or args.import_file):
+            print('--dry-run 不支持移除或还原；未执行任何操作。')
+            sys.exit(EXIT_OPERATION_FAILED)
+        needs_admin = bool(args.remove or args.import_file or
+                           ((args.block or args.hash or args.template_import) and not args.dry_run))
+        if needs_admin and not is_admin():
             print("需要管理员权限。请右键 → 以管理员身份运行。")
             sys.exit(EXIT_NEED_ADMIN)
-        load_preset_cert_data()
-        repair_legacy_rules()
-        _run_cli(args)
+        try:
+            _run_cli(args)
+        except (ValueError, OSError) as e:
+            print('操作未完成：' + str(e), file=sys.stderr)
+            sys.exit(EXIT_OPERATION_FAILED)
         return
 
     # GUI mode
