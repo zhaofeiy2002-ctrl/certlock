@@ -912,6 +912,43 @@ def _sanitize_export_desc(desc):
     return desc
 
 
+_TEMPLATE_EXPORT_KEYS = ('format_version', 'source', 'protection', 'vendor_info', 'rules')
+_TEMPLATE_EXPORT_VENDOR_KEYS = ('name', 'notes')
+_TEMPLATE_EXPORT_RULE_KEYS = ('type', 'description', 'disallowed', 'thumbprint',
+                              'cert_data', 'subject', 'not_after')
+
+
+def build_shareable_template(template, keep_indices):
+    """Build a shareable template keeping only protocol fields and sanitized text.
+
+    Drops unknown fields (e.g. local paths or usernames) from third-party
+    templates instead of passing them through to the exported file.
+    """
+    clean = {}
+    for key in _TEMPLATE_EXPORT_KEYS:
+        if key in template:
+            clean[key] = copy.deepcopy(template[key])
+    vendor = clean.get('vendor_info')
+    if isinstance(vendor, dict):
+        clean['vendor_info'] = {
+            k: copy.deepcopy(vendor[k])
+            for k in _TEMPLATE_EXPORT_VENDOR_KEYS if k in vendor
+        }
+    rules = template.get('rules', [])
+    clean['rules'] = []
+    for idx in keep_indices:
+        if idx < 0 or idx >= len(rules):
+            continue
+        src = rules[idx]
+        if not isinstance(src, dict):
+            continue
+        kept = {k: copy.deepcopy(src[k]) for k in _TEMPLATE_EXPORT_RULE_KEYS if k in src}
+        if isinstance(kept.get('description'), str):
+            kept['description'] = _sanitize_export_desc(kept['description'])
+        clean['rules'].append(kept)
+    return clean
+
+
 def build_common_template():
     """Build a portable preset from bundled DER data; never consult local policy."""
     rules = []
@@ -2651,8 +2688,10 @@ class CertLockApp:
     # Path Whitelist UI
     # ============================================================
     def on_add_path_whitelist(self):
-        """Add a path rule (Unrestricted) to whitelist a specific program
-        so it can run despite a certificate/hash block."""
+        """Add an SRP path rule (Unrestricted) to allow a specific program.
+
+        A path allow rule cannot override a higher-priority certificate or
+        hash disallow rule."""
         filepath = filedialog.askopenfilename(
             title="选择要加入白名单的程序 (.exe)",
             filetypes=[
@@ -2685,8 +2724,8 @@ class CertLockApp:
             f"即将为以下程序添加路径白名单：\n\n"
             f"  文件: {fname}\n"
             f"  路径: {filepath}\n\n"
-            f"该程序将不受证书封禁策略限制。\n"
-            f"⚠ 证书规则优先于路径规则；路径允许不能覆盖证书禁止。\n\n"
+            f"将为此文件创建 SRP 路径允许规则。\n"
+            f"路径允许不能覆盖更高优先级的证书或哈希禁止规则。\n\n"
             f"确定添加？"
         )
         if not confirm:
@@ -2702,7 +2741,8 @@ class CertLockApp:
                 f"路径规则已写入！\n\n"
                 f"  文件: {fname}\n"
                 f"  路径: {filepath}\n\n"
-                f"该程序将被排除在证书封禁策略之外。"
+                f"已为此文件创建 SRP 路径允许规则。\n"
+                f"注意：路径允许不能覆盖更高优先级的证书或哈希禁止规则。"
             )
             self.status_label.config(text=f"已添加白名单: {fname}")
             self._add_history("path_whitelist", guid, fname)
@@ -2865,11 +2905,10 @@ class CertLockApp:
             ttk.Button(actions, text='手动指定 WPS', command=choose_wps).pack(side=tk.LEFT, padx=(0, 6))
         ttk.Button(actions, text='添加保留程序', command=choose_keep).pack(side=tk.LEFT)
         def chosen_data():
-            chosen = copy.deepcopy(data)
-            chosen['rules'] = [r for r, var in zip(chosen['rules'], selected) if var.get()]
-            if not chosen['rules']:
+            keep_indices = [i for i, var in enumerate(selected) if var.get()]
+            if not keep_indices:
                 raise ValueError('请至少选择一条规则。')
-            return chosen
+            return build_shareable_template(data, keep_indices)
         def export_selection():
             try:
                 chosen = chosen_data()

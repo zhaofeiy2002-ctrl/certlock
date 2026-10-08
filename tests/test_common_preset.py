@@ -140,6 +140,36 @@ class CommonPresetTests(unittest.TestCase):
         self.assertTrue(expired)
         self.assertEqual(date, '2024-05-30')
 
+    def test_export_template_drops_unknown_fields_and_sanitizes_description(self):
+        data = copy.deepcopy(self.template)
+        data['exported_by'] = 'C:\\Users\\alice'
+        data['exported_at'] = '2026-10-08 10:00:00'
+        data['local_path'] = 'C:\\Users\\alice\\Desktop\\secret.txt'
+        data['vendor_info']['website'] = 'https://example.com'
+        data['vendor_info']['products'] = 'some product'
+        data['vendor_info']['secret_note'] = 'C:\\Users\\alice\\secret'
+        data['rules'][0]['description'] = '360 block C:\\Users\\alice\\secret.exe'
+        data['rules'][0]['extra_field'] = 'should be dropped'
+
+        out = certlock.build_shareable_template(data, [0])
+
+        self.assertNotIn('exported_by', out)
+        self.assertNotIn('exported_at', out)
+        self.assertNotIn('local_path', out)
+        self.assertNotIn('website', out['vendor_info'])
+        self.assertNotIn('products', out['vendor_info'])
+        self.assertNotIn('secret_note', out['vendor_info'])
+        self.assertNotIn('extra_field', out['rules'][0])
+
+        self.assertEqual(out['format_version'], '2.0')
+        self.assertEqual(out['source'], 'CertLock')
+        self.assertEqual(out['protection'], certlock.WPS_PROTECTION)
+        self.assertEqual(out['rules'][0]['thumbprint'], self.template['rules'][0]['thumbprint'])
+        self.assertEqual(out['rules'][0]['cert_data'], self.template['rules'][0]['cert_data'])
+
+        self.assertNotIn('C:\\Users', out['rules'][0]['description'])
+        self.assertIn('[PATH]', out['rules'][0]['description'])
+
 
 if __name__ == '__main__':
     unittest.main()
