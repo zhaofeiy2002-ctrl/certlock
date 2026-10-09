@@ -1,55 +1,32 @@
 @echo off
+setlocal
 chcp 65001 >nul
-echo ============================================
-echo   CertLock Build Script
-echo ============================================
-echo.
-
-:: Check Python
+cd /d "%~dp0"
+set PYTHONIOENCODING=utf-8
+set PIP_DISABLE_PIP_VERSION_CHECK=1
 python --version >nul 2>&1
-if %errorlevel% neq 0 (
-    echo [ERROR] Python not found in PATH
-    pause
-    exit /b 1
-)
-
-:: Check PyInstaller
-python -c "import PyInstaller" >nul 2>&1
-if %errorlevel% neq 0 (
-    echo [INFO] Installing PyInstaller...
-    pip install pyinstaller
-)
-
-echo [1/2] Cleaning old builds...
-if exist build rmdir /s /q build
-if exist dist rmdir /s /q dist
-
-echo [2/2] Building single executable...
-python -m PyInstaller certlock.spec --clean --noconfirm
-
-if %errorlevel% neq 0 (
-    echo [ERROR] Build failed!
-    pause
-    exit /b 1
-)
-
-echo.
-echo ============================================
-echo   Build Complete!
-echo   Output: dist\CertLock.exe
-echo ============================================
-dir dist\CertLock.exe 2>nul
-
-:: UPX compression (optional)
-where upx >nul 2>&1
-if %errorlevel% equ 0 (
-    echo.
-    echo [OPTIONAL] Compressing with UPX...
-    upx --best --lzma dist\CertLock.exe
-    echo After UPX:
-    dir dist\CertLock.exe 2>nul
-)
-
-echo.
-echo Done! Portable executable is ready.
-pause
+if errorlevel 1 exit /b 1
+python -m pip install -r requirements-dev.txt
+if errorlevel 1 exit /b 1
+for /f %%v in ('python -c "import certlock; print(certlock.APP_VERSION)"') do set VERSION=%%v
+for /f %%i in ('python -c "import uuid; print(uuid.uuid4().hex)"') do set RUN_ID=%%i
+if not defined VERSION exit /b 1
+if not defined RUN_ID exit /b 1
+set OUTPUT=dist\local-%RUN_ID%\CertLock_v%VERSION%-portable
+if exist "%OUTPUT%" exit /b 1
+python -m unittest discover -s tests -v
+if errorlevel 1 exit /b 1
+python tests/smoke_preset_gui.py
+if errorlevel 1 exit /b 1
+python -m PyInstaller certlock.spec --distpath "%OUTPUT%" --workpath "build\local-%RUN_ID%" --noconfirm
+if errorlevel 1 exit /b 1
+python tests/verify_packaged.py --release-dir "%OUTPUT%"
+if errorlevel 1 exit /b 1
+copy /-Y "LICENSE" "%OUTPUT%\LICENSE" >nul
+if errorlevel 1 exit /b 1
+copy /-Y "THIRD_PARTY_NOTICES.md" "%OUTPUT%\THIRD_PARTY_NOTICES.md" >nul
+if errorlevel 1 exit /b 1
+copy /-Y "docs\常用预设使用说明.md" "%OUTPUT%\使用说明.md" >nul
+if errorlevel 1 exit /b 1
+echo Build verified: %OUTPUT%
+echo No previous build or release was removed.

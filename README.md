@@ -8,6 +8,18 @@
 
 CertLock 为选定的代码签名证书写入 Windows 软件限制策略（SRP）规则，并提供规则查看、移除、备份、导入和路径例外管理。它不安装驱动、服务或后台进程。
 
+## v2.1.1 安全修复
+
+修正 v2.1.0 功能核查中发现的问题，保留原有桌面界面和主题。
+
+- 打开程序不再自动迁移旧规则或将默认禁止改成默认允许；既有策略保持原样。
+- 根据 PKCS#7 签名者标识匹配证书，不按证书大小或厂商名称猜测。暂不支持的多签名、嵌套签名会明确拒绝。
+- 无法完整读取现有证书策略或备份时停止导入，界面显示读取失败，不当作空规则。
+- 新建哈希封禁仍未启用，明确提示功能限制，不再误报管理员权限。
+- 列表显示的是已配置规则，不是操作系统拦截成功的证明。证书提取也不代表签名或信任链验证通过。
+
+[查看 v2.1.1 更新说明](docs/releases/v2.1.1.md)
+
 ## 工作方式
 
 ```mermaid
@@ -21,7 +33,7 @@ flowchart LR
 
 规则针对使用所选证书签名的文件。路径允许规则不能覆盖更高优先级的证书禁止规则。
 
-## 常用预设：保留 WPS（v2.1.0）
+## 常用预设：保留 WPS
 
 点击“常用预设（保留 WPS）”，或通过“导入模板”选择随包的 `常用预设-保留WPS.json`。
 支持 360、2345、鲁大师、腾讯共享签名和两张金山安全证书，共六张候选证书。
@@ -35,7 +47,7 @@ flowchart LR
 - 腾讯证书并非电脑管家专用，同证书的 QQ、腾讯视频等也会受影响；确认列表后再导入。
 
 这是有限证书预设，不是“除 WPS 外所有软件”的通用封禁。换证的新版本、无签名程序和未收录厂商不在覆盖保证内。WPS 核对限于所选目录中可读取的嵌入签名，不代替目标 Windows 环境实测。
-必须用 v2.1.0 或更新版导入这个保护模板；旧版不识别 WPS 保护字段。
+保护字段从 v2.1.0 开始提供；请使用 v2.1.1 安全修复版。更早版本不识别 WPS 保护字段。
 
 ```powershell
 # 无需管理员权限，导出预设与预览；不修改系统策略
@@ -49,7 +61,7 @@ CertLock.exe --template-import common.json --wps-dir "C:\实际的WPS安装目�
 
 ## 开始使用
 
-[下载 CertLock v2.1.0 便携版](https://github.com/zhaofeiy2002-ctrl/certlock/releases/download/v2.1.0/CertLock_v2.1.0-portable.zip)
+[下载 CertLock v2.1.1 便携版](https://github.com/zhaofeiy2002-ctrl/certlock/releases/download/v2.1.1/CertLock_v2.1.1-portable.zip)
 
 解压后，右键 `CertLock.exe` 并选择“以管理员身份运行”。写入策略需要管理员权限。
 
@@ -63,13 +75,13 @@ CertLock.exe --template-import common.json --wps-dir "C:\实际的WPS安装目�
 - 停止创建未经验证的 SRP 哈希规则；保留旧规则查询和移除能力。
 - 社区模板只导出证书规则。
 
-完整记录见 [CHANGELOG.md](CHANGELOG.md)，最新发布文件见 [v2.1.0 Release](https://github.com/zhaofeiy2002-ctrl/certlock/releases/tag/v2.1.0)。
+完整记录见 [CHANGELOG.md](CHANGELOG.md)，最新发布文件见 [v2.1.1 Release](https://github.com/zhaofeiy2002-ctrl/certlock/releases/tag/v2.1.1)。
 
 ## 能做什么
 
 | 功能 | 说明 |
 | --- | --- |
-| 证书规则 | 从已签名文件提取证书，并写入 SRP 禁止规则。 |
+| 证书规则 | 从支持的单签名 PE 文件提取签名者证书，并写入 SRP 禁止规则。 |
 | 内置预设 | 提供仓库中已包含证书数据的预设。 |
 | 路径白名单 | 为精确文件路径创建 SRP `Unrestricted` 例外。 |
 | 规则管理 | 查看、移除、备份和还原证书规则。 |
@@ -83,12 +95,15 @@ CertLock.exe --template-import common.json --wps-dir "C:\实际的WPS安装目�
 - v2.0.0 不创建普通 SHA-256 注册表哈希规则。Windows SRP 的哈希由其策略组件计算，普通 SHA-256 不足以证明规则可以匹配。
 - 添加、移除或还原规则后，请注销并重新登录，或重启计算机，再验证目标程序行为。
 - 请在隔离 Windows 环境中先验证规则，再用于日常工作环境。
+- 当前提取范围为 EXE/DLL 的嵌入式单签名；多签名、嵌套签名会拒绝，Catalog 签名和 MSI 不在支持范围内。
+- 证书策略备份不是完整系统回滚；导入备份不自动删除后来新增的规则，也不回滚 TrustedPublisher 证书存储。
+- SRP 已被微软标记为弃用，兼容性与实际拦截需按目标 Windows 版本验收；不是所有 Windows 10/11 环境的效果保证。[微软 SRP 说明](https://learn.microsoft.com/en-us/windows-server/identity/software-restriction-policies/software-restriction-policies)
 
 ## 操作步骤
 
-1. 下载并解压 [v2.1.0 ZIP](https://github.com/zhaofeiy2002-ctrl/certlock/releases/download/v2.1.0/CertLock_v2.1.0-portable.zip)。
+1. 下载并解压 [v2.1.1 ZIP](https://github.com/zhaofeiy2002-ctrl/certlock/releases/download/v2.1.1/CertLock_v2.1.1-portable.zip)。
 2. 右键 `CertLock.exe`，选择“以管理员身份运行”。
-3. 选择内置预设，或选择一个已签名的 `.exe`、`.dll` 或 `.msi` 文件。
+3. 选择内置预设，或选择支持的单签名 `.exe`、`.dll` 文件。
 4. 确认显示的证书信息后写入规则。
 5. 注销并重新登录或重启，再在隔离环境验证结果。
 
@@ -118,7 +133,7 @@ CertLock.exe --template-export template.json
 CertLock.exe --template-import template.json
 ```
 
-`--hash` 在 v2.0.0 中不创建新规则，用于阻止继续写入未经验证的 SRP 哈希数据。
+`--hash` 不创建新规则，返回明确的功能未启用提示与退出码 4，不需要提升权限重试。GUI 单文件包不提供可靠的终端输出窗口；开发时可使用 `python certlock.py` 查看 CLI 文本。
 
 ## 路径白名单
 
@@ -139,16 +154,21 @@ HKLM\SOFTWARE\Policies\Microsoft\Windows\Safer\CodeIdentifiers
 ```powershell
 git clone https://github.com/zhaofeiy2002-ctrl/certlock.git
 cd certlock
-pip install pyinstaller
-python -m PyInstaller certlock.spec --clean --noconfirm
+python -m pip install -r requirements-dev.txt
+python -m unittest discover -s tests -v
+python -m PyInstaller certlock.spec --distpath dist/CertLock_v2.1.1-portable --workpath build/v2.1.1 --noconfirm
+python tests/verify_packaged.py
 ```
 
-构建输出：`dist\CertLock.exe`。
+构建输出：`dist\CertLock_v2.1.1-portable\CertLock.exe`。测试生成预设时拒绝覆盖现有文件，重复验收请用新的构建目录并传入 `--release-dir`。`build.bat` 会使用唯一目录，不删除旧版产物。
+
+仅从源码运行需先安装 `requirements.txt`。ASN.1 解析使用 asn1crypto；cryptography 仅用于生成测试数据，不随应用执行安装或导入测试证书。
 
 运行测试：
 
 ```powershell
 python -m unittest discover -s tests -v
+python tests/smoke_preset_gui.py
 ```
 
 ## 贡献与许可

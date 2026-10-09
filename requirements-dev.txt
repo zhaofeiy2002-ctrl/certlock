@@ -1,0 +1,3 @@
+-r requirements.txt
+cryptography==48.0.0
+pyinstaller==6.21.0

@@ -1,11 +1,11 @@
 # -*- mode: python ; coding: utf-8 -*-
-
+from PyInstaller.utils.hooks import copy_metadata
 
 a = Analysis(
     ['certlock.py'],
     pathex=[],
     binaries=[],
-    datas=[('certs', 'certs')],
+    datas=[('certs', 'certs')] + copy_metadata('asn1crypto'),
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-CertLock v2.1.0 — Windows Certificate Blocker
+CertLock v2.1.1 — Windows Certificate Blocker
 =============================================
 A lightweight GUI tool to block unwanted software via Windows
 Software Restriction Policy (SRP) certificate & hash rules,
@@ -30,6 +30,7 @@ import base64
 import struct
 import tempfile
 import copy
+from asn1crypto import cms
 import uuid
 import argparse
 import winreg
@@ -46,7 +47,7 @@ for _stream in (sys.stdout, sys.stderr):
 # Constants
 # ============================================================
 APP_NAME    = "CertLock"
-APP_VERSION = "2.1.0"
+APP_VERSION = "2.1.1"
 SRP_ROOT    = r"SOFTWARE\Policies\Microsoft\Windows\Safer\CodeIdentifiers"
 CERT_RULES  = SRP_ROOT + "\\0\\Certificates"
 HASH_RULES  = SRP_ROOT + "\\0\\Hashes"
@@ -270,6 +271,10 @@ def check_policy_conflicts():
 # ============================================================
 # Registry Operations
 # ============================================================
+class PolicyReadError(OSError):
+    """An unreadable policy must never be treated as an empty policy."""
+
+
 def reg_open_srp(mode="r"):
     """Open the SRP CodeIdentifiers key. Create if writing."""
     access = winreg.KEY_READ if mode == "r" else winreg.KEY_ALL_ACCESS
@@ -309,8 +314,8 @@ def reg_list_certs():
             return results
 
         # Enumerate subkeys (each is a certificate rule)
-        idx = 0
-        while True:
+        for idx in range(winreg.QueryInfoKey(certs)[0]):
+            rule = None
             try:
                 thumbprint = winreg.EnumKey(certs, idx)
                 rule = winreg.OpenKey(
@@ -322,14 +327,10 @@ def reg_list_certs():
                     desc, _ = winreg.QueryValueEx(rule, "Description")
                 except FileNotFoundError:
                     desc = "(no description)"
-                try:
-                    flags, _ = winreg.QueryValueEx(rule, "SaferFlags")
-                except FileNotFoundError:
-                    flags = 0
-                try:
-                    data, _ = winreg.QueryValueEx(rule, "ItemData")
-                except FileNotFoundError:
-                    data = ""
+                flags, flags_type = winreg.QueryValueEx(rule, "SaferFlags")
+                data, data_type = winreg.QueryValueEx(rule, "ItemData")
+                if flags_type != winreg.REG_DWORD or data_type not in (winreg.REG_BINARY, winreg.REG_SZ):
+                    raise PolicyReadError("证书规则数据类型异常，无法确认现有策略。")
 
                 results.append({
                     "thumbprint": thumbprint,
@@ -337,12 +338,11 @@ def reg_list_certs():
                     "disallowed": (flags == 0),
                     "cert_data": data,
                 })
-                winreg.CloseKey(rule)
-                idx += 1
-            except OSError:
-                break
-    except Exception as e:
-        print(f"[CertLock] reg_list_certs failed: {e}", file=sys.stderr)
+            finally:
+                if rule:
+                    winreg.CloseKey(rule)
+    except OSError as e:
+        raise PolicyReadError(f"无法完整读取证书策略，已停止本次操作：{e}") from e
     finally:
         if certs:
             winreg.CloseKey(certs)
@@ -432,51 +432,12 @@ def reg_add_cert(thumbprint, cert_blob_b64, description):
 
 
 def repair_legacy_rules():
-    """Migrate v1.6.0 rules written with wrong registry value types.
+    """Compatibility hook: automatic policy migration is intentionally disabled.
 
-    v1.6.0 wrote certificate ItemData as REG_SZ (base64 text); SRP ignores a
-    cert rule whose ItemData isn't a raw DER blob, so nothing was blocked.
-    It could also leave DefaultLevel=0 (Disallowed), which blocks *every*
-    program. Rewrite cert rules as REG_BINARY and reset DefaultLevel to
-    Unrestricted. Idempotent; returns number of rules repaired.
+    A default-deny policy is not proof of a CertLock bug. Never rewrite it or
+    import certificates merely because the GUI was opened.
     """
-    fixed = 0
-    try:
-        srp = reg_open_srp("w")
-        if srp is not None:
-            try:
-                level, _ = winreg.QueryValueEx(srp, "DefaultLevel")
-                if level == 0:
-                    winreg.SetValueEx(
-                        srp, "DefaultLevel", 0, winreg.REG_DWORD,
-                        SAFER_LEVELID_UNRESTRICTED
-                    )
-                    fixed += 1
-            except FileNotFoundError:
-                pass
-            winreg.CloseKey(srp)
-    except Exception:
-        pass
-
-    # REG_SZ (str) = legacy base64; REG_BINARY (bytes) is already correct.
-    for rule in reg_list_certs():
-        data = rule.get("cert_data")
-        thumbprint = rule.get("thumbprint")
-        if not isinstance(data, str) or not thumbprint:
-            continue
-        try:
-            raw = base64.b64decode(data)
-            key = winreg.OpenKey(
-                winreg.HKEY_LOCAL_MACHINE, f"{CERT_RULES}\\{thumbprint}",
-                0, winreg.KEY_ALL_ACCESS
-            )
-            winreg.SetValueEx(key, "ItemData", 0, winreg.REG_BINARY, raw)
-            winreg.CloseKey(key)
-            _import_to_trusted_publishers(raw)
-            fixed += 1
-        except Exception:
-            continue
-    return fixed
+    return 0
 
 
 def reg_remove_cert(thumbprint):
@@ -551,29 +512,30 @@ def reg_export_all_rules():
     rules = {
         'version': APP_VERSION,
         'exported_at': '',  # filled by caller if needed
-        'default_level': 0,
-        'policy_scope': 0,
-        'authenticodeenabled': 1,
+        'policy_present': False,
+        'default_level': None,
+        'policy_scope': None,
+        'authenticodeenabled': None,
         'certificates': [],
     }
+    srp = None
     try:
         srp = reg_open_srp("r")
         if srp:
-            try:
-                rules['default_level'], _ = winreg.QueryValueEx(srp, 'DefaultLevel')
-            except Exception:
-                pass
-            try:
-                rules['policy_scope'], _ = winreg.QueryValueEx(srp, 'PolicyScope')
-            except Exception:
-                pass
-            try:
-                rules['authenticodeenabled'], _ = winreg.QueryValueEx(srp, 'authenticodeenabled')
-            except Exception:
-                pass
+            rules['policy_present'] = True
+            for field, name in (('default_level', 'DefaultLevel'), ('policy_scope', 'PolicyScope'),
+                                ('authenticodeenabled', 'authenticodeenabled')):
+                try:
+                    rules[field], value_type = winreg.QueryValueEx(srp, name)
+                    if value_type != winreg.REG_DWORD:
+                        raise PolicyReadError('策略值类型异常：' + name)
+                except FileNotFoundError:
+                    pass  # Preserve absence as null, never invent a default.
+    except OSError as e:
+        raise PolicyReadError(f"无法完整读取策略备份，未执行导入：{e}") from e
+    finally:
+        if srp:
             winreg.CloseKey(srp)
-    except Exception:
-        pass
 
     certs = reg_list_certs()
     for c in certs:
@@ -581,7 +543,8 @@ def reg_export_all_rules():
             'thumbprint': c['thumbprint'],
             'description': c['description'],
             'disallowed': c['disallowed'],
-            'cert_data': c.get('cert_data', ''),
+            'cert_data': (base64.b64encode(c['cert_data']).decode('ascii')
+                          if isinstance(c.get('cert_data'), bytes) else c.get('cert_data', '')),
         })
     return rules
 
@@ -1195,7 +1158,7 @@ def extract_cert_from_exe(exe_path):
             'ISSUER': issuer,
             'NOTBEFORE': not_before,
             'NOTAFTER': not_after,
-            'STATUS': 'Valid',
+            'STATUS': 'ExtractedNotVerified',
             'BLOB_LEN': str(len(b64)),
             'cert_blob': b64,
         }
@@ -1349,60 +1312,44 @@ def _parse_x509_subject_and_issuer(der_bytes):
 
 
 def _extract_signer_cert_from_pkcs7(pkcs7_der):
-    """Extract signer cert from PKCS#7 SignedData. Returns DER bytes."""
-    der = pkcs7_der
-    pos = 0
-    # ContentInfo SEQUENCE
-    tag, _, ci_val, ci_end = _read_tlv(der, pos)
-    if tag != 0x30:
-        raise ValueError("Expected SEQUENCE")
+    """Match SignerIdentifier, not certificate size or publisher name.
 
-    pos = ci_val
-    while pos < ci_end and der[pos] != 0xA0:
-        pos = _skip_tlv(der, pos)
-    if pos >= ci_end:
-        raise ValueError("[0] not found")
-
-    # [0] SignedData → SEQUENCE
-    _, _, sd_val, _ = _read_tlv(der, pos)
-    tag, _, seq_val, seq_end = _read_tlv(der, sd_val)
-    if tag != 0x30:
-        raise ValueError("Expected SEQUENCE")
-
-    # Collect certs from [0] certificates
-    certs = []
-    pos = seq_val
-    while pos < seq_end:
-        if der[pos] == 0xA0:
-            _, _, certs_val, certs_end = _read_tlv(der, pos)
-            p = certs_val
-            while p < certs_end:
-                ct, _, _, cnx = _read_tlv(der, p)
-                if ct == 0x30:
-                    certs.append(der[p:cnx])
-                p = cnx
-            pos = certs_end
-        else:
-            pos = _skip_tlv(der, pos)
-
-    if not certs:
-        raise ValueError("No certificates found")
-    if len(certs) == 1:
-        return certs[0]
-
-    # Filter out CA certs, pick largest end-entity cert
-    ca_kw = ['DigiCert', 'VeriSign', 'GlobalSign', 'Sectigo', 'thawte',
-             'Certum', 'Entrust', 'Go Daddy', "Let's Encrypt", 'Amazon',
-             'Symantec', 'GeoTrust', 'RapidSSL', 'Comodo', 'Microsoft']
-    non_ca = []
-    for c in certs:
-        try:
-            subj, _, _, _ = _parse_x509_subject_and_issuer(c)
-            if not any(kw.lower() in subj.lower() for kw in ca_kw):
-                non_ca.append(c)
-        except Exception:
-            non_ca.append(c)
-    return max(non_ca or certs, key=len)
+    This identifies the embedded signer, not Authenticode validity or trust.
+    Multiple/nested signatures are rejected until all signers can be handled.
+    """
+    try:
+        content = cms.ContentInfo.load(pkcs7_der, strict=True)
+        if content['content_type'].native != 'signed_data':
+            raise ValueError('Not PKCS#7 SignedData')
+        signed = content['content']
+        signers = signed['signer_infos']
+        if len(signers) != 1:
+            raise ValueError('需要唯一签名者；不支持空签名或多个签名者。')
+        signer = signers[0]
+        for attr in signer['unsigned_attrs']:
+            if attr['type'].dotted == '1.3.6.1.4.1.311.2.4.1':
+                raise ValueError('暂不支持嵌套签名，无法完整核对所有签名者。')
+        sid = signer['sid']
+        matches = set()
+        for entry in signed['certificates']:
+            if entry.name != 'certificate':
+                continue
+            cert = entry.chosen
+            if sid.name == 'issuer_and_serial_number':
+                identity = sid.chosen
+                matches_sid = (cert.issuer == identity['issuer'] and
+                               cert.serial_number == identity['serial_number'].native)
+            elif sid.name == 'subject_key_identifier':
+                matches_sid = cert.key_identifier == sid.native
+            else:
+                raise ValueError('不支持的签名者标识。')
+            if matches_sid:
+                matches.add(cert.dump())
+        if len(matches) != 1:
+            raise ValueError('找不到唯一匹配签名者的证书，已停止提取。')
+        return matches.pop()
+    except (TypeError, KeyError, IndexError) as e:
+        raise ValueError('PKCS#7 签名结构无效。') from e
 
 
 def _extract_cert_from_pe(exe_path):
@@ -1414,24 +1361,32 @@ def _extract_cert_from_pe(exe_path):
 
     if len(data) < 64:
         raise ValueError("File too small")
+    if data[:2] != b'MZ':
+        raise ValueError("Not a valid PE file")
 
     # DOS header → PE offset
     pe_offset = struct.unpack_from('<I', data, 0x3C)[0]
-    if data[pe_offset:pe_offset + 4] != b'PE\x00\x00':
+    if pe_offset + 24 > len(data) or data[pe_offset:pe_offset + 4] != b'PE\x00\x00':
         raise ValueError("Not a valid PE file")
 
     # COFF → Optional Header → DataDirectory[4]
     coff = pe_offset + 4
     size_opt = struct.unpack_from('<H', data, coff + 16)[0]
     opt = coff + 20
+    if size_opt < 2 or opt + size_opt > len(data):
+        raise ValueError('Truncated optional header')
     magic = struct.unpack_from('<H', data, opt)[0]
-    dd_start = opt + (96 if magic == 0x10b else 112 if magic == 0x20b else None)
-    if dd_start is None:
+    if magic not in (0x10b, 0x20b):
         raise ValueError(f"Unknown PE magic: 0x{magic:04x}")
+    dd_start = opt + (96 if magic == 0x10b else 112)
+    if dd_start + 5 * 8 > opt + size_opt:
+        raise ValueError('Truncated PE data directory')
 
     cert_va, cert_size = struct.unpack_from('<II', data, dd_start + 4 * 8)
     if cert_size == 0 or cert_va == 0:
         raise ValueError("No digital signature")
+    if cert_va + cert_size > len(data):
+        raise ValueError('Truncated certificate table')
 
     # WIN_CERTIFICATE → PKCS#7
     win_cert = data[cert_va:cert_va + cert_size]
@@ -1440,6 +1395,10 @@ def _extract_cert_from_pe(exe_path):
     dw_len, _, w_type = struct.unpack_from('<IHH', win_cert, 0)
     if w_type != 0x0002:
         raise ValueError(f"Not PKCS_SIGNED_DATA")
+    if dw_len < 8 or dw_len > cert_size:
+        raise ValueError('Truncated WIN_CERTIFICATE')
+    if cert_size > ((dw_len + 7) & ~7):
+        raise ValueError('暂不支持多个嵌入签名，无法完整核对所有签名者。')
 
     pkcs7 = win_cert[8:dw_len]
     signer_der = _extract_signer_cert_from_pkcs7(pkcs7)
@@ -1521,6 +1480,7 @@ def get_app_dir():
 class CertLockApp:
     def __init__(self, root, policy_conflicts=None):
         self.root = root
+        self.root.report_callback_exception = self._report_callback_exception
         self.root.title(f"{APP_NAME} v{APP_VERSION}")
         self.root.geometry("780x620")
         self.root.minsize(640, 500)
@@ -1570,6 +1530,11 @@ class CertLockApp:
         x = (sw - w) // 2
         y = (sh - h) // 2
         self.root.geometry(f"+{x}+{y}")
+
+    def _report_callback_exception(self, exc_type, error, traceback):
+        if hasattr(self, 'status_label'):
+            self.status_label.config(text='操作未完成：' + str(error))
+        messagebox.showerror('操作未完成', str(error), parent=self.root)
 
     def setup_styles(self):
         style = ttk.Style()
@@ -1666,7 +1631,7 @@ class CertLockApp:
         )
         self.list_title.pack(side=tk.LEFT)
         ttk.Label(
-            list_header, text="(SaferFlags=0 表示已阻止运行)",
+            list_header, text="(列表为已配置规则，实际拦截需验证)",
             style="Status.TLabel", foreground="gray"
         ).pack(side=tk.LEFT, padx=(8, 0))
         # View toggle
@@ -2241,7 +2206,7 @@ class CertLockApp:
         filepath = filedialog.askopenfilename(
             title="选择已签名的 .exe 文件",
             filetypes=[
-                ("可执行文件", "*.exe;*.dll;*.msi"),
+                ("签名 PE 文件", "*.exe;*.dll"),
                 ("所有文件", "*.*"),
             ]
         )
@@ -2270,9 +2235,9 @@ class CertLockApp:
             f"{impact}\n"
             f"  颁发者: {issuer}\n"
             f"  指纹  : {thumbprint[:40]}...\n\n"
-            f"封禁后，该厂商签名的所有 .exe/.dll/.msi\n"
-            f"将被 Windows 阻止运行。\n\n"
-            f"⚠ 需要重启计算机才能完全生效。\n\n"
+            f"规则仅针对上述证书签名的文件，不保证覆盖厂商所有版本。\n"
+            f"证书提取不代表已验证签名有效性。\n\n"
+            f"请注销或重启后在目标系统验证实际拦截。\n\n"
             f"确定继续？"
         )
         if not confirm:
@@ -2498,7 +2463,7 @@ class CertLockApp:
             )
             confirm = messagebox.askyesno(
                 "一键封禁",
-                f"将封禁 {label} 所有软件：\n\n"
+                f"将添加 {label} 的以下证书禁止规则：\n\n"
                 f"{impact}\n\n"
                 f"  证书指纹 ({len(thumbprints)} 张):\n{tp_display}\n"
                 f"⚠ 需要重启计算机才能完全生效。\n\n"
@@ -2547,7 +2512,7 @@ class CertLockApp:
         filepath = filedialog.askopenfilename(
             title=f"选择 {label} 的签名文件 (.exe)",
             filetypes=[
-                ("可执行文件", "*.exe;*.dll;*.msi"),
+                ("签名 PE 文件", "*.exe;*.dll"),
                 ("所有文件", "*.*"),
             ]
         )
@@ -2611,78 +2576,11 @@ class CertLockApp:
         self.refresh_list()
 
     def on_block_hash(self):
-        """Block an unsigned file by SHA256 hash."""
-        filepath = filedialog.askopenfilename(
-            title="选择要封禁的文件",
-            filetypes=[
-                ("可执行文件", "*.exe;*.dll;*.msi"),
-                ("所有文件", "*.*"),
-            ]
-        )
-        if not filepath:
-            return
-
-        # System directory protection
-        is_sys, sys_path = is_system_path(filepath)
-        if is_sys:
-            messagebox.showerror(
-                "禁止操作 — 系统目录保护",
-                f"拒绝封禁系统目录下的文件！\n\n"
-                f"文件: {os.path.basename(filepath)}\n"
-                f"路径: {sys_path}\n\n"
-                f"封禁系统文件可能导致操作系统无法启动。\n\n"
-                f"如需处理系统组件，请使用其他安全策略工具。"
-            )
-            self.status_label.config(text="操作已拒绝 — 受保护的系统路径")
-            return
-
-        self.status_label.config(text=f"正在计算哈希: {os.path.basename(filepath)}...")
-        self.root.update()
-
-        try:
-            sha256 = _compute_sha256(filepath)
-        except Exception as e:
-            messagebox.showerror("哈希计算失败", str(e))
-            self.status_label.config(text="哈希计算失败")
-            return
-
-        fname = os.path.basename(filepath)
-        desc = f"Block {fname} (SHA256: {sha256[:16]}...)"
-
-        confirm = messagebox.askyesno(
-            "确认哈希封禁",
-            f"即将按 SHA256 哈希封禁此文件：\n\n"
-            f"  文件名: {fname}\n"
-            f"  SHA256 : {sha256[:40]}...\n\n"
-            f"注意：哈希封禁仅阻止此精确文件。\n"
-            f"若软件更新，需重新封禁新版本。\n\n"
-            f"⚠ 需要重启计算机才能完全生效。\n\n"
-            f"确定继续？"
-        )
-        if not confirm:
-            self.status_label.config(text="已取消")
-            return
-
-        success = reg_add_hash(filepath, desc)
-        if success:
-            self._add_history("hash_block", sha256, fname)
-            write_event_log(
-                f"Blocked file hash: {fname} ({sha256[:16]}...)",
-                1002, "WARNING"
-            )
-            messagebox.showinfo(
-                "封禁成功",
-                f"哈希规则已写入！\n\n"
-                f"  文件: {fname}\n"
-                f"  SHA256: {sha256[:40]}...\n\n"
-                f"⚠ 需要重启计算机才能完全生效。"
-            )
-            self.status_label.config(text=f"已封禁(哈希): {fname} | 重启后生效")
-        else:
-            messagebox.showerror("封禁失败", "写入注册表失败。请以管理员身份运行。")
-            self.status_label.config(text="封禁失败 — 请检查管理员权限")
-
-        self.refresh_list()
+        """Retain the legacy callback without pretending hash creation works."""
+        messagebox.showinfo('暂不支持新建哈希封禁',
+                            '当前版本未提供经 Windows 验证的哈希规则创建能力。\n'
+                            '这是功能限制，不是管理员权限问题；没有修改任何策略。')
+        self.status_label.config(text='新建哈希封禁未启用；未修改策略')
 
     # ============================================================
     # Path Whitelist UI
@@ -3102,6 +3000,16 @@ class CertLockApp:
     # Override: refresh_list with hash support
     # ============================================================
     def refresh_list(self):
+        try:
+            self._refresh_list_from_registry()
+        except PolicyReadError as error:
+            for item in self.tree.get_children():
+                self.tree.delete(item)
+            self.tree.insert('', tk.END, values=('(读取失败)', '无法确认现有证书策略', '未知'))
+            self.policy_label.config(text='策略: 无法读取', foreground='red')
+            self._report_callback_exception(type(error), error, None)
+
+    def _refresh_list_from_registry(self):
         """Refresh the list from registry (certs, hashes, or paths depending on view)."""
         for item in self.tree.get_children():
             self.tree.delete(item)
@@ -3164,13 +3072,13 @@ class CertLockApp:
                 )
             else:
                 for c in certs:
-                    status_text = "已阻止" if c['disallowed'] else "已允许"
+                    status_text = "禁止规则" if c['disallowed'] else "允许规则"
                     # Check certificate expiry
                     cert_data = c.get('cert_data', '')
                     if cert_data:
                         expired, expiry_str = _check_cert_expiry(cert_data)
                         if expired:
-                            status_text = f"已阻止 ⚠过期({expiry_str})"
+                            status_text += f" ⚠过期({expiry_str})"
                     self.tree.insert("", tk.END, values=(
                         c['thumbprint'],
                         c['description'],
@@ -3184,18 +3092,18 @@ class CertLockApp:
                         expired_count += 1
                 exp_note = f" | {expired_count} 张证书已过期" if expired_count else ""
                 self.status_label.config(
-                    text=f"共 {len(certs)} 个证书规则 | 重启后完全生效{exp_note}"
+                    text=f"共 {len(certs)} 个证书规则 | 注销后请验证实际拦截{exp_note}"
                 )
 
         # Update policy status
         if reg_is_policy_active():
             self.policy_label.config(
-                text="策略: 已启用",
+                text="证书规则开关: 已启用",
                 foreground="#4ec94e" if self.is_dark else "green"
             )
         else:
             self.policy_label.config(
-                text="策略: 未配置",
+                text="证书规则开关: 未启用",
                 foreground="#f44747" if self.is_dark else "red"
             )
 
@@ -3373,7 +3281,7 @@ def _cli_list(fmt="text"):
     if certs:
         print(f"\n=== 证书规则 ({len(certs)} 条) ===")
         for c in certs:
-            status = "已阻止" if c['disallowed'] else "已允许"
+            status = "禁止规则" if c['disallowed'] else "允许规则"
             print(f"  {c['thumbprint']}  {status}")
             print(f"    {c['description']}")
     if hashes:
@@ -3616,7 +3524,7 @@ def main():
             print('--dry-run 不支持移除或还原；未执行任何操作。')
             sys.exit(EXIT_OPERATION_FAILED)
         needs_admin = bool(args.remove or args.import_file or
-                           ((args.block or args.hash or args.template_import) and not args.dry_run))
+                           ((args.block or args.template_import) and not args.dry_run))
         if needs_admin and not is_admin():
             print("需要管理员权限。请右键 → 以管理员身份运行。")
             sys.exit(EXIT_NEED_ADMIN)
@@ -3633,13 +3541,17 @@ def main():
         sys.exit(EXIT_SUCCESS)
 
     load_preset_cert_data()
-    repair_legacy_rules()
 
     # Check for policy conflicts on startup
     conflicts = check_policy_conflicts()
 
     root = tk.Tk()
-    app = CertLockApp(root, conflicts)
+    try:
+        app = CertLockApp(root, conflicts)
+    except PolicyReadError as error:
+        messagebox.showerror('无法读取策略', str(error), parent=root)
+        root.destroy()
+        return
     root.mainloop()
 
 
