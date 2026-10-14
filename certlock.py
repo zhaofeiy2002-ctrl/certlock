@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-CertLock v2.1.1 — Windows Certificate Blocker
+CertLock v2.1.2 — Windows Certificate Blocker
 =============================================
 A lightweight GUI tool to block unwanted software via Windows
 Software Restriction Policy (SRP) certificate & hash rules,
@@ -47,7 +47,7 @@ for _stream in (sys.stdout, sys.stderr):
 # Constants
 # ============================================================
 APP_NAME    = "CertLock"
-APP_VERSION = "2.1.1"
+APP_VERSION = "2.1.2"
 SRP_ROOT    = r"SOFTWARE\Policies\Microsoft\Windows\Safer\CodeIdentifiers"
 CERT_RULES  = SRP_ROOT + "\\0\\Certificates"
 HASH_RULES  = SRP_ROOT + "\\0\\Hashes"
@@ -1482,8 +1482,8 @@ class CertLockApp:
         self.root = root
         self.root.report_callback_exception = self._report_callback_exception
         self.root.title(f"{APP_NAME} v{APP_VERSION}")
-        self.root.geometry("780x620")
-        self.root.minsize(640, 500)
+        self.root.geometry("820x700")
+        self.root.minsize(760, 640)
         self.root.resizable(True, True)
 
         # Detect system theme
@@ -1494,6 +1494,10 @@ class CertLockApp:
 
         # v2 manages certificate blocks and explicit path exceptions.
         self.view_mode = "cert"  # "cert" | "path"
+        self._rule_items = []
+        self._rendered_view = None
+        self._search_timer = None
+        self._last_backup_file = None
 
         # Policy conflicts detected at startup
         self.policy_conflicts = policy_conflicts or []
@@ -1530,6 +1534,8 @@ class CertLockApp:
         x = (sw - w) // 2
         y = (sh - h) // 2
         self.root.geometry(f"+{x}+{y}")
+        self.root.bind('<Control-f>', self._focus_search)
+        self.root.bind('<F5>', lambda event: self.refresh_list())
 
     def _report_callback_exception(self, exc_type, error, traceback):
         if hasattr(self, 'status_label'):
@@ -1611,7 +1617,7 @@ class CertLockApp:
         ).pack(anchor=tk.W)
         ttk.Label(
             title_frame,
-            text="Windows 证书封禁 + 路径白名单 | 单文件 · 便携 · 无残留",
+            text="Windows 证书规则 + 路径白名单 | 单文件 · 便携",
             style="Subtitle.TLabel"
         ).pack(anchor=tk.W)
 
@@ -1641,6 +1647,18 @@ class CertLockApp:
         )
         self.btn_toggle_view.pack(side=tk.RIGHT)
 
+        search_row = ttk.Frame(main_frame)
+        search_row.pack(fill=tk.X, pady=(6, 2))
+        ttk.Label(search_row, text='搜索').pack(side=tk.LEFT)
+        self.search_var = tk.StringVar(self.root)
+        self.search_entry = ttk.Entry(search_row, textvariable=self.search_var)
+        self.search_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(6, 4))
+        self.search_var.trace_add('write', self._schedule_filter)
+        self.search_entry.bind('<Escape>', lambda event: self._clear_search())
+        ttk.Button(search_row, text='清空', width=6, command=self._clear_search).pack(side=tk.LEFT)
+        self.result_count = ttk.Label(search_row, text='', width=14, anchor=tk.E)
+        self.result_count.pack(side=tk.RIGHT)
+
         # Treeview
         tree_frame = ttk.Frame(main_frame)
         tree_frame.pack(fill=tk.BOTH, expand=True, pady=(4, 8))
@@ -1658,12 +1676,18 @@ class CertLockApp:
         self.tree.column("description", width=280, minwidth=150)
         self.tree.column("status", width=80, minwidth=60, anchor=tk.CENTER)
 
-        # Scrollbar
+        # Both axes are needed for long paths and certificate descriptions.
         scrollbar = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL, command=self.tree.yview)
-        self.tree.configure(yscrollcommand=scrollbar.set)
-
-        self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        xscrollbar = ttk.Scrollbar(tree_frame, orient=tk.HORIZONTAL, command=self.tree.xview)
+        self.tree.configure(yscrollcommand=scrollbar.set, xscrollcommand=xscrollbar.set)
+        tree_frame.rowconfigure(0, weight=1)
+        tree_frame.columnconfigure(0, weight=1)
+        self.tree.grid(row=0, column=0, sticky='nsew')
+        scrollbar.grid(row=0, column=1, sticky='ns')
+        xscrollbar.grid(row=1, column=0, sticky='ew')
+        self.tree.bind('<<TreeviewSelect>>', self._update_selection_actions)
+        self.tree.bind('<Control-c>', self.on_copy_rule)
+        self.tree.bind('<Button-3>', self._rule_context_menu)
 
         # === Button bar row 1: certificate operations ===
         btn_row1 = ttk.Frame(main_frame)
@@ -1727,8 +1751,14 @@ class CertLockApp:
         )
         self.btn_template_import.pack(side=tk.RIGHT, padx=(0, 4))
 
-        ttk.Button(main_frame, text="常用预设（保留 WPS）",
-                   command=self.on_common_preset).pack(anchor=tk.W, pady=(0, 8))
+        utility_row = ttk.Frame(main_frame)
+        utility_row.pack(fill=tk.X, pady=(0, 8))
+        ttk.Button(utility_row, text="常用预设（保留 WPS）",
+                   command=self.on_common_preset).pack(side=tk.LEFT)
+        self.btn_copy_rule = ttk.Button(utility_row, text='复制指纹',
+                                        command=self.on_copy_rule, state=tk.DISABLED)
+        self.btn_copy_rule.pack(side=tk.LEFT, padx=6)
+        ttk.Button(utility_row, text='打开备份目录', command=self.on_open_backup_folder).pack(side=tk.RIGHT)
 
         # Separator
         ttk.Separator(main_frame, orient=tk.HORIZONTAL).pack(fill=tk.X)
@@ -1837,12 +1867,12 @@ class CertLockApp:
             highlightthickness=1, padx=8, pady=4
         )
         tk.Label(
-            self.restart_banner, text="⚠️ 证书封禁需重启计算机后生效",
+            self.restart_banner, text="⚠️ 规则变更后请注销或重启",
             bg=rb_bg, fg=rb_fg, font=("Segoe UI", 9, "bold")
         ).pack(side=tk.LEFT)
         tk.Label(
             self.restart_banner,
-            text="已封禁的软件在重启前仍可运行",
+            text="实际拦截需在目标系统验证",
             bg=rb_bg, fg=rb_fg, font=("Segoe UI", 9)
         ).pack(side=tk.LEFT, padx=(8, 0))
 
@@ -1904,6 +1934,123 @@ class CertLockApp:
             foreground="#808080" if self.is_dark else "gray"
         )
         self.policy_label.pack(side=tk.RIGHT)
+
+        # Reserve status space first; only the rule list shrinks with the window.
+        status_frame.pack_configure(before=main_frame)
+        self._status_separator.pack_configure(before=main_frame)
+        rows = [(child, child.pack_info().get('pady', 0)) for child in main_frame.winfo_children()]
+        for child, _ in rows:
+            child.pack_forget()
+        for row, (child, padding) in enumerate(rows):
+            child.grid(row=row, column=0, sticky='nsew' if child is tree_frame else 'ew', pady=padding)
+            if child is tree_frame:
+                main_frame.rowconfigure(row, weight=1)
+        main_frame.columnconfigure(0, weight=1)
+
+    def _focus_search(self, event=None):
+        self.search_entry.focus_set()
+        self.search_entry.selection_range(0, tk.END)
+        return 'break'
+
+    def _clear_search(self):
+        self.search_var.set('')
+        self._filter_rule_items()
+        return 'break'
+
+    def _schedule_filter(self, *args):
+        if self._search_timer is not None:
+            self.root.after_cancel(self._search_timer)
+        self._search_timer = self.root.after(150, self._filter_rule_items)
+        self._update_selection_actions()
+
+    def _selected_rule(self):
+        selection = self.tree.selection()
+        if not selection or selection[0] not in self.tree.get_children():
+            return None
+        item = selection[0]
+        values = self.tree.item(item, 'values')
+        if not values or str(values[0]).startswith('('):
+            return None
+        return item, values
+
+    def _update_selection_actions(self, event=None):
+        selected = self._search_timer is None and self._selected_rule() is not None
+        self.btn_remove.config(state=tk.NORMAL if selected else tk.DISABLED)
+        self.btn_copy_rule.config(state=tk.NORMAL if selected else tk.DISABLED,
+                                  text='复制路径' if self.view_mode == 'path' else '复制指纹')
+        self.btn_export.config(state=tk.NORMAL if selected and self.view_mode == 'cert' else tk.DISABLED)
+
+    def _filter_rule_items(self):
+        if self._search_timer is not None:
+            self.root.after_cancel(self._search_timer)
+            self._search_timer = None
+        if self._rendered_view is None:
+            return
+        query = self.search_var.get().strip().casefold()
+        visible = 0
+        for item in self._rule_items:
+            values = self.tree.item(item, 'values')
+            matches = not query or any(query in str(value).casefold() for value in values)
+            if matches:
+                self.tree.move(item, '', tk.END)
+                visible += 1
+            else:
+                self.tree.selection_remove(item)
+                if self.tree.focus() == item:
+                    self.tree.focus('')
+                self.tree.detach(item)
+        self.result_count.config(text=f'{visible} / {len(self._rule_items)} 条')
+        self._update_selection_actions()
+
+    def on_copy_rule(self, event=None, include_details=False):
+        if self._search_timer is not None:
+            self._filter_rule_items()
+        selected = self._selected_rule()
+        if selected is None:
+            return 'break'
+        _, values = selected
+        text = '\t'.join(map(str, values)) if include_details else str(values[0])
+        self.root.clipboard_clear()
+        self.root.clipboard_append(text)
+        self.status_label.config(text='已复制规则信息' if include_details else
+                                 ('已复制完整路径' if self.view_mode == 'path' else '已复制完整指纹'))
+        return 'break'
+
+    def _rule_context_menu(self, event):
+        item = self.tree.identify_row(event.y)
+        if not item:
+            return 'break'
+        self.tree.selection_set(item)
+        self.tree.focus(item)
+        if self._selected_rule() is None:
+            return 'break'
+        self._update_selection_actions()
+        if not hasattr(self, '_rule_menu'):
+            self._rule_menu = tk.Menu(self.root, tearoff=False)
+        menu = self._rule_menu
+        menu.delete(0, tk.END)
+        if self.is_dark:
+            menu.config(background='#252526', foreground='#d4d4d4',
+                        activebackground='#094771', activeforeground='#ffffff')
+        menu.add_command(label='复制完整路径' if self.view_mode == 'path' else '复制完整指纹',
+                         command=self.on_copy_rule)
+        menu.add_command(label='复制整条规则', command=lambda: self.on_copy_rule(include_details=True))
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+        return 'break'
+
+    def on_open_backup_folder(self):
+        folder = (os.path.dirname(self._last_backup_file) if self._last_backup_file else
+                  os.path.join(os.environ.get('LOCALAPPDATA', os.path.expanduser('~')), 'CertLock', 'backups'))
+        if not os.path.isdir(folder):
+            messagebox.showinfo('暂无备份目录', '尚未找到备份目录。\n' + folder, parent=self.root)
+            return
+        try:
+            os.startfile(folder)
+        except OSError as error:
+            messagebox.showerror('无法打开备份目录', str(error), parent=self.root)
 
     # ============================================================
     # Policy conflict warning
@@ -2340,6 +2487,7 @@ class CertLockApp:
             import json
             with open(filename, "w", encoding="utf-8") as f:
                 json.dump(rules, f, indent=2, ensure_ascii=False)
+            self._last_backup_file = filename
             messagebox.showinfo(
                 "备份成功",
                 f"已导出 {len(rules['certificates'])} 条证书规则到:\n{filename}"
@@ -2842,6 +2990,8 @@ class CertLockApp:
         if rechecked != plan:
             raise ValueError("签名或本机规则在预览后发生变化，请重新预览。")
         report = apply_template_plan(plan)
+        if report['backup']:
+            self._last_backup_file = report['backup']
         msg = "新增 %d 条，跳过 %d 条，失败 %d 条。\n备份：%s" % (
             len(report["added"]), report["skipped"], len(report["failed"]), report["backup"])
         if report["failed"]:
@@ -3000,19 +3150,45 @@ class CertLockApp:
     # Override: refresh_list with hash support
     # ============================================================
     def refresh_list(self):
+        selected = self._selected_rule()
+        previous = None
+        if selected and self._rendered_view == self.view_mode:
+            previous = selected[0] if self.view_mode == 'path' else str(selected[1][0])
+        scroll = self.tree.yview()
         try:
             self._refresh_list_from_registry()
-        except PolicyReadError as error:
+            self._rule_items = [item for item in self.tree.get_children()
+                                if not str(self.tree.item(item, 'values')[0]).startswith('(')]
+            self._rendered_view = self.view_mode
+            self._filter_rule_items()
             for item in self.tree.get_children():
-                self.tree.delete(item)
+                key = item if self.view_mode == 'path' else str(self.tree.item(item, 'values')[0])
+                if previous is not None and key == previous:
+                    self.tree.selection_set(item)
+                    self.tree.focus(item)
+                    break
+            if scroll:
+                self.tree.yview_moveto(scroll[0])
+            self._update_selection_actions()
+        except PolicyReadError as error:
+            for item in set(self._rule_items) | set(self.tree.get_children()):
+                if self.tree.exists(item):
+                    self.tree.delete(item)
+            self._rule_items = []
+            self._rendered_view = None
             self.tree.insert('', tk.END, values=('(读取失败)', '无法确认现有证书策略', '未知'))
             self.policy_label.config(text='策略: 无法读取', foreground='red')
+            self.result_count.config(text='读取失败')
+            self._update_selection_actions()
             self._report_callback_exception(type(error), error, None)
 
     def _refresh_list_from_registry(self):
         """Refresh the list from registry (certs, hashes, or paths depending on view)."""
-        for item in self.tree.get_children():
-            self.tree.delete(item)
+        # Filtered rows are detached, not deleted; remove them on an actual refresh.
+        for item in set(self._rule_items) | set(self.tree.get_children()):
+            if self.tree.exists(item):
+                self.tree.delete(item)
+        self._rule_items = []
 
         if self.view_mode == "hash":
             # Hash view

@@ -8,6 +8,18 @@
 
 CertLock 为选定的代码签名证书写入 Windows 软件限制策略（SRP）规则，并提供规则查看、移除、备份、导入和路径例外管理。它不安装驱动、服务或后台进程。
 
+## v2.1.2 易用性改进
+
+- 按描述、指纹、路径或状态搜索当前列表，显示匹配数量。搜索不修改规则，也不会在每次输入时重新扫描策略。
+- 复制完整指纹/路径，或右键复制整条规则；长内容可横向滚动查看。
+- 刷新后保留仍然存在且匹配搜索条件的选中项；隐藏项不保留选中状态，避免误操作。
+- 快速打开自动备份目录；本次运行刚保存过手动备份时，打开最近备份所在目录。不会自动创建空目录。
+- 紧凑窗口保留状态栏和操作按钮，延续深浅主题。底层封禁、签名解析、导入、移除和确认规则未改变。
+
+快捷操作：`Ctrl+F` 定位搜索，搜索框中 `Esc` 清空，列表中 `Ctrl+C` 复制选中指纹/路径，`F5` 刷新。
+
+[查看 v2.1.2 更新说明](docs/releases/v2.1.2.md)
+
 ## v2.1.1 安全修复
 
 修正 v2.1.0 功能核查中发现的问题，保留原有桌面界面和主题。
@@ -47,7 +59,7 @@ flowchart LR
 - 腾讯证书并非电脑管家专用，同证书的 QQ、腾讯视频等也会受影响；确认列表后再导入。
 
 这是有限证书预设，不是“除 WPS 外所有软件”的通用封禁。换证的新版本、无签名程序和未收录厂商不在覆盖保证内。WPS 核对限于所选目录中可读取的嵌入签名，不代替目标 Windows 环境实测。
-保护字段从 v2.1.0 开始提供；请使用 v2.1.1 安全修复版。更早版本不识别 WPS 保护字段。
+保护字段从 v2.1.0 开始提供；请使用包含 v2.1.1 安全修复的 v2.1.2。更早版本不识别 WPS 保护字段。
 
 ```powershell
 # 无需管理员权限，导出预设与预览；不修改系统策略
@@ -61,7 +73,7 @@ CertLock.exe --template-import common.json --wps-dir "C:\实际的WPS安装目�
 
 ## 开始使用
 
-[下载 CertLock v2.1.1 便携版](https://github.com/zhaofeiy2002-ctrl/certlock/releases/download/v2.1.1/CertLock_v2.1.1-portable.zip)
+[下载 CertLock v2.1.2 便携版](https://github.com/zhaofeiy2002-ctrl/certlock/releases/download/v2.1.2/CertLock_v2.1.2-portable.zip)
 
 解压后，右键 `CertLock.exe` 并选择“以管理员身份运行”。写入策略需要管理员权限。
 
@@ -75,7 +87,7 @@ CertLock.exe --template-import common.json --wps-dir "C:\实际的WPS安装目�
 - 停止创建未经验证的 SRP 哈希规则；保留旧规则查询和移除能力。
 - 社区模板只导出证书规则。
 
-完整记录见 [CHANGELOG.md](CHANGELOG.md)，最新发布文件见 [v2.1.1 Release](https://github.com/zhaofeiy2002-ctrl/certlock/releases/tag/v2.1.1)。
+完整记录见 [CHANGELOG.md](CHANGELOG.md)，最新发布文件见 [v2.1.2 Release](https://github.com/zhaofeiy2002-ctrl/certlock/releases/tag/v2.1.2)。
 
 ## 能做什么
 
@@ -101,7 +113,7 @@ CertLock.exe --template-import common.json --wps-dir "C:\实际的WPS安装目�
 
 ## 操作步骤
 
-1. 下载并解压 [v2.1.1 ZIP](https://github.com/zhaofeiy2002-ctrl/certlock/releases/download/v2.1.1/CertLock_v2.1.1-portable.zip)。
+1. 下载并解压 [v2.1.2 ZIP](https://github.com/zhaofeiy2002-ctrl/certlock/releases/download/v2.1.2/CertLock_v2.1.2-portable.zip)。
 2. 右键 `CertLock.exe`，选择“以管理员身份运行”。
 3. 选择内置预设，或选择支持的单签名 `.exe`、`.dll` 文件。
 4. 确认显示的证书信息后写入规则。
@@ -156,11 +168,11 @@ git clone https://github.com/zhaofeiy2002-ctrl/certlock.git
 cd certlock
 python -m pip install -r requirements-dev.txt
 python -m unittest discover -s tests -v
-python -m PyInstaller certlock.spec --distpath dist/CertLock_v2.1.1-portable --workpath build/v2.1.1 --noconfirm
+python -m PyInstaller certlock.spec --distpath dist/CertLock_v2.1.2-portable --workpath build/v2.1.2 --noconfirm
 python tests/verify_packaged.py
 ```
 
-构建输出：`dist\CertLock_v2.1.1-portable\CertLock.exe`。测试生成预设时拒绝覆盖现有文件，重复验收请用新的构建目录并传入 `--release-dir`。`build.bat` 会使用唯一目录，不删除旧版产物。
+构建输出：`dist\CertLock_v2.1.2-portable\CertLock.exe`。测试生成预设时拒绝覆盖现有文件，重复验收请用新的构建目录并传入 `--release-dir`。`build.bat` 会使用唯一目录，不删除旧版产物。
 
 仅从源码运行需先安装 `requirements.txt`。ASN.1 解析使用 asn1crypto；cryptography 仅用于生成测试数据，不随应用执行安装或导入测试证书。
 
@@ -169,6 +181,7 @@ python tests/verify_packaged.py
 ```powershell
 python -m unittest discover -s tests -v
 python tests/smoke_preset_gui.py
+python tests/ui_usability_check.py
 ```
 
 ## 贡献与许可

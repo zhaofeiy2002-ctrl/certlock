@@ -1,0 +1,89 @@
+name: Release CertLock v2.1.2
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [master]
+    paths: ['.github/workflows/release-v2.1.2.yml']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: certlock-release-v2.1.2
+  cancel-in-progress: false
+
+jobs:
+  release:
+    if: github.ref == 'refs/heads/master'
+    runs-on: windows-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      PYTHONIOENCODING: utf-8
+      PIP_DISABLE_PIP_VERSION_CHECK: '1'
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12.9'
+      - name: Install and test
+        run: |
+          python -m pip install -r requirements-dev.txt
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          python -c "import certlock; assert certlock.APP_VERSION == '2.1.2'"
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          python -m unittest discover -s tests -v
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          python tests/ui_usability_check.py
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          python tests/smoke_preset_gui.py
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Build and verify
+        run: |
+          python -m PyInstaller certlock.spec --distpath dist/CertLock_v2.1.2-portable --workpath build/release-v2.1.2 --noconfirm
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          python tests/verify_packaged.py
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Package
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $release = 'dist/CertLock_v2.1.2-portable'
+          Copy-Item -LiteralPath 'docs/常用预设使用说明.md' -Destination "$release/使用说明.md"
+          Copy-Item -LiteralPath LICENSE -Destination "$release/LICENSE"
+          Copy-Item -LiteralPath THIRD_PARTY_NOTICES.md -Destination "$release/THIRD_PARTY_NOTICES.md"
+          Get-ChildItem -LiteralPath $release -File | Where-Object Name -ne 'SHA256SUMS.txt' | Sort-Object Name | ForEach-Object {
+            $hash = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            "$hash  $($_.Name)"
+          } | Set-Content -LiteralPath "$release/SHA256SUMS.txt" -Encoding utf8
+          Compress-Archive -LiteralPath $release -DestinationPath dist/CertLock_v2.1.2-portable.zip
+          $hash = (Get-FileHash -LiteralPath dist/CertLock_v2.1.2-portable.zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  CertLock_v2.1.2-portable.zip" | Set-Content -LiteralPath dist/CertLock_v2.1.2-SHA256.txt -Encoding utf8
+      - name: Publish only this commit without overwriting earlier releases
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $repo = $env:GITHUB_REPOSITORY
+          $releases = gh api "repos/$repo/releases?per_page=100" | ConvertFrom-Json
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $existing = @($releases | Where-Object tag_name -eq 'v2.1.2')
+          if ($existing.Count -and -not $existing[0].draft) { throw 'v2.1.2 already public; refusing overwrite' }
+          if ($existing.Count -and $existing[0].target_commitish -ne $env:GITHUB_SHA) { throw 'Draft belongs to another commit' }
+          $refs = @(gh api "repos/$repo/git/matching-refs/tags/v2.1.2" | ConvertFrom-Json)
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $tag = @($refs | Where-Object ref -eq 'refs/tags/v2.1.2')
+          if ($tag.Count -and ($tag[0].object.type -ne 'commit' -or $tag[0].object.sha -ne $env:GITHUB_SHA)) { throw 'Tag does not match build commit' }
+          if (-not $existing.Count) {
+            gh release create v2.1.2 --target $env:GITHUB_SHA --title 'CertLock v2.1.2 - 规则查找与操作便利性改进' --notes-file docs/releases/v2.1.2.md --draft
+            if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          }
+          gh release upload v2.1.2 dist/CertLock_v2.1.2-portable.zip dist/CertLock_v2.1.2-SHA256.txt --clobber
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          gh release edit v2.1.2 --draft=false --latest
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }

@@ -152,6 +152,9 @@ class PolicySafetyTests(unittest.TestCase):
 
     def test_gui_read_failure_is_visible_not_an_empty_list(self):
         app = SimpleNamespace(tree=MagicMock(), policy_label=MagicMock(), _report_callback_exception=MagicMock(),
+                              _selected_rule=MagicMock(return_value=None), _rule_items=[],
+                              _rendered_view=None, view_mode='cert', result_count=MagicMock(),
+                              _update_selection_actions=MagicMock(),
                               _refresh_list_from_registry=MagicMock(side_effect=certlock.PolicyReadError('denied')))
         certlock.CertLockApp.refresh_list(app)
         app._report_callback_exception.assert_called_once()
